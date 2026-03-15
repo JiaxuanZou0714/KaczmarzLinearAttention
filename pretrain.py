@@ -69,9 +69,13 @@ def main(args):
     fabric.logger.log_hyperparams(args)
     monitor = Monitor(fabric, window_size=2, time_unit="seconds", log_iter_interval=args.log_iter_interval)
 
+    resume_path = os.path.join(args.out_dir, "latest-model-ckpt.pth")
     if os.path.exists(args.out_dir):
-        args.resume = True
-        print('Resuming from {}'.format(args.out_dir))
+        args.resume = os.path.isfile(resume_path)
+        if args.resume:
+            print('Resuming from {}'.format(args.out_dir))
+        elif fabric.global_rank == 0:
+            fabric.print(f"Found existing output directory but no checkpoint at {resume_path}. Starting from scratch.")
     else:
         if fabric.global_rank == 0:
             os.makedirs(args.out_dir)
@@ -118,14 +122,13 @@ def main(args):
 
     if args.resume:
         try:
-            resume = os.path.join(args.out_dir, "latest-model-ckpt.pth")
             if fabric.global_rank == 0:
-                fabric.print(f"Resuming training from {resume}")
-            fabric.load(resume, state)
-            fabric.print(f"Successfully resumed from {resume}")
-        except:
-            fabric.print(f"Failed to resume from {resume}")
-            args.resume = False
+                fabric.print(f"Resuming training from {resume_path}")
+            fabric.load(resume_path, state)
+            fabric.print(f"Successfully resumed from {resume_path}")
+        except Exception as e:
+            fabric.print(f"Failed to resume from {resume_path}: {e!r}")
+            raise RuntimeError(f"Resume requested but loading checkpoint failed: {resume_path}") from e
     train_time = time.perf_counter()
     train(args, fabric, state, train_dataloader, val_dataloader, monitor, args.resume)
     if fabric.global_rank == 0:
