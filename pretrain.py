@@ -15,6 +15,7 @@ from typing import Optional, Tuple, Union
 import math
 import lightning as L
 import torch
+import torch.nn.functional as F
 from lightning.fabric.strategies import FSDPStrategy
 from torch.utils.data import DataLoader
 from functools import partial
@@ -24,7 +25,7 @@ from lit_gpt.model import GPT, Block, MBlock, Config
 from lit_gpt.packed_dataset import CombinedDataset, PackedDataset
 from lit_gpt.speed_monitor import SpeedMonitorFabric as Monitor
 from lit_gpt.speed_monitor import estimate_flops
-from lit_gpt.utils import chunked_cross_entropy, num_parameters
+from lit_gpt.utils import num_parameters
 from pytorch_lightning.loggers import WandbLogger
 from transformers import AutoTokenizer
 from lit_gpt import FusedCrossEntropyLoss
@@ -290,7 +291,8 @@ def validate(args, fabric: L.Fabric, model: torch.nn.Module, val_dataloader: Dat
     fabric.print("Validating ...")
     model.eval()
 
-    losses = torch.zeros(eval_iters, args.num_extrapol, device=fabric.device)
+    loss_sums = torch.zeros(args.num_extrapol, device=fabric.device)
+    token_counts = torch.zeros(args.num_extrapol, device=fabric.device)
     for k, val_data in enumerate(val_dataloader):
         if k >= eval_iters:
             break
@@ -299,10 +301,21 @@ def validate(args, fabric: L.Fabric, model: torch.nn.Module, val_dataloader: Dat
             input_ids = val_data[:, 0 : length].contiguous()
             targets = val_data[:, 1 : length + 1].contiguous()
             logits = model(input_ids)
-            loss = chunked_cross_entropy(logits, targets, chunk_size=0)
-            losses[k,i] = loss.item()
+            logits = logits.reshape(-1, logits.size(-1))
+            targets = targets.reshape(-1)
+            valid_mask = targets != -1
 
-    out = losses.mean(0)
+            if valid_mask.any():
+                per_token_loss = F.cross_entropy(logits, targets, ignore_index=-1, reduction="none")
+                loss_sums[i] += per_token_loss[valid_mask].sum()
+                token_counts[i] += valid_mask.sum()
+
+    # Aggregate validation numerators and denominators across all ranks, so logged
+    # loss/ppl represent global validation statistics instead of rank-local values.
+    loss_sums = fabric.all_reduce(loss_sums, reduce_op="sum")
+    token_counts = fabric.all_reduce(token_counts, reduce_op="sum")
+    out = loss_sums / token_counts.clamp(min=1)
+
     model.train()
     return out
 
