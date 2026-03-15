@@ -39,6 +39,24 @@ from distutils.dir_util import copy_tree
 import pdb
 os.environ["TRITON_CACHE_MANAGER"] = "cache:ParallelFileCacheManager"
 
+
+def find_resume_checkpoint(out_dir: str) -> str | None:
+    """Return a checkpoint path to resume from, preferring latest then final."""
+    candidates = [
+        os.path.join(out_dir, "latest-model-ckpt.pth"),
+        os.path.join(out_dir, "final-model-ckpt.pth"),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+
+    all_ckpts = sorted(
+        glob.glob(os.path.join(out_dir, "*-model-ckpt.pth")),
+        key=os.path.getmtime,
+        reverse=True,
+    )
+    return all_ckpts[0] if all_ckpts else None
+
 def main(args):
     if args.debug:
         wandb_logger = WandbLogger(project="linear_attn", mode='disabled', name=args.exp_name, id=args.exp_name, save_dir=args.wandb_dir, dir=args.wandb_dir, version=args.exp_name, group="debug")
@@ -69,13 +87,19 @@ def main(args):
     fabric.logger.log_hyperparams(args)
     monitor = Monitor(fabric, window_size=2, time_unit="seconds", log_iter_interval=args.log_iter_interval)
 
-    resume_path = os.path.join(args.out_dir, "latest-model-ckpt.pth")
+    resume_path = find_resume_checkpoint(args.out_dir)
     if os.path.exists(args.out_dir):
-        args.resume = os.path.isfile(resume_path)
+        args.resume = resume_path is not None
         if args.resume:
             print('Resuming from {}'.format(args.out_dir))
+            if fabric.global_rank == 0:
+                fabric.print(f"Auto-selected checkpoint: {resume_path}")
         elif fabric.global_rank == 0:
-            fabric.print(f"Found existing output directory but no checkpoint at {resume_path}. Starting from scratch.")
+            expected_ckpts = [
+                os.path.join(args.out_dir, "latest-model-ckpt.pth"),
+                os.path.join(args.out_dir, "final-model-ckpt.pth"),
+            ]
+            fabric.print(f"Found existing output directory but no checkpoint at {expected_ckpts}. Starting from scratch.")
     else:
         if fabric.global_rank == 0:
             os.makedirs(args.out_dir)
@@ -122,6 +146,8 @@ def main(args):
 
     if args.resume:
         try:
+            if resume_path is None:
+                raise RuntimeError(f"Resume requested but no checkpoint found in {args.out_dir}")
             if fabric.global_rank == 0:
                 fabric.print(f"Resuming training from {resume_path}")
             fabric.load(resume_path, state)
@@ -197,6 +223,9 @@ def train(args, fabric, state, train_dataloader, val_dataloader, monitor, resume
         else:
             state['optimizer'] = None
             fabric.save(checkpoint_path, state)
+            latest_checkpoint_path = os.path.join(args.out_dir, "latest-model-ckpt.pth")
+            fabric.print(f"Updating latest checkpoint to {str(latest_checkpoint_path)!r}")
+            fabric.save(latest_checkpoint_path, state)
 
     for train_data in train_dataloader:
         tokens += model.config.block_size * args.micro_batch_size
