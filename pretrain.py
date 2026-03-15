@@ -15,6 +15,7 @@ from typing import Optional, Tuple, Union
 import math
 import lightning as L
 import torch
+import torch.nn.functional as F
 from lightning.fabric.strategies import FSDPStrategy
 from torch.utils.data import DataLoader
 from functools import partial
@@ -24,7 +25,7 @@ from lit_gpt.model import GPT, Block, MBlock, Config
 from lit_gpt.packed_dataset import CombinedDataset, PackedDataset
 from lit_gpt.speed_monitor import SpeedMonitorFabric as Monitor
 from lit_gpt.speed_monitor import estimate_flops
-from lit_gpt.utils import chunked_cross_entropy, num_parameters
+from lit_gpt.utils import num_parameters
 from pytorch_lightning.loggers import WandbLogger
 from transformers import AutoTokenizer
 from lit_gpt import FusedCrossEntropyLoss
@@ -37,6 +38,24 @@ import shutil
 from distutils.dir_util import copy_tree
 import pdb
 os.environ["TRITON_CACHE_MANAGER"] = "cache:ParallelFileCacheManager"
+
+
+def find_resume_checkpoint(out_dir: str) -> str | None:
+    """Return a checkpoint path to resume from, preferring latest then final."""
+    candidates = [
+        os.path.join(out_dir, "latest-model-ckpt.pth"),
+        os.path.join(out_dir, "final-model-ckpt.pth"),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+
+    all_ckpts = sorted(
+        glob.glob(os.path.join(out_dir, "*-model-ckpt.pth")),
+        key=os.path.getmtime,
+        reverse=True,
+    )
+    return all_ckpts[0] if all_ckpts else None
 
 def main(args):
     if args.debug:
@@ -68,9 +87,19 @@ def main(args):
     fabric.logger.log_hyperparams(args)
     monitor = Monitor(fabric, window_size=2, time_unit="seconds", log_iter_interval=args.log_iter_interval)
 
+    resume_path = find_resume_checkpoint(args.out_dir)
     if os.path.exists(args.out_dir):
-        args.resume = True
-        print('Resuming from {}'.format(args.out_dir))
+        args.resume = resume_path is not None
+        if args.resume:
+            print('Resuming from {}'.format(args.out_dir))
+            if fabric.global_rank == 0:
+                fabric.print(f"Auto-selected checkpoint: {resume_path}")
+        elif fabric.global_rank == 0:
+            expected_ckpts = [
+                os.path.join(args.out_dir, "latest-model-ckpt.pth"),
+                os.path.join(args.out_dir, "final-model-ckpt.pth"),
+            ]
+            fabric.print(f"Found existing output directory but no checkpoint at {expected_ckpts}. Starting from scratch.")
     else:
         if fabric.global_rank == 0:
             os.makedirs(args.out_dir)
@@ -117,14 +146,15 @@ def main(args):
 
     if args.resume:
         try:
-            resume = os.path.join(args.out_dir, "latest-model-ckpt.pth")
+            if resume_path is None:
+                raise RuntimeError(f"Resume requested but no checkpoint found in {args.out_dir}")
             if fabric.global_rank == 0:
-                fabric.print(f"Resuming training from {resume}")
-            fabric.load(resume, state)
-            fabric.print(f"Successfully resumed from {resume}")
-        except:
-            fabric.print(f"Failed to resume from {resume}")
-            args.resume = False
+                fabric.print(f"Resuming training from {resume_path}")
+            fabric.load(resume_path, state)
+            fabric.print(f"Successfully resumed from {resume_path}")
+        except Exception as e:
+            fabric.print(f"Failed to resume from {resume_path}: {e!r}")
+            raise RuntimeError(f"Resume requested but loading checkpoint failed: {resume_path}") from e
     train_time = time.perf_counter()
     train(args, fabric, state, train_dataloader, val_dataloader, monitor, args.resume)
     if fabric.global_rank == 0:
@@ -193,6 +223,9 @@ def train(args, fabric, state, train_dataloader, val_dataloader, monitor, resume
         else:
             state['optimizer'] = None
             fabric.save(checkpoint_path, state)
+            latest_checkpoint_path = os.path.join(args.out_dir, "latest-model-ckpt.pth")
+            fabric.print(f"Updating latest checkpoint to {str(latest_checkpoint_path)!r}")
+            fabric.save(latest_checkpoint_path, state)
 
     for train_data in train_dataloader:
         tokens += model.config.block_size * args.micro_batch_size
@@ -290,7 +323,8 @@ def validate(args, fabric: L.Fabric, model: torch.nn.Module, val_dataloader: Dat
     fabric.print("Validating ...")
     model.eval()
 
-    losses = torch.zeros(eval_iters, args.num_extrapol, device=fabric.device)
+    loss_sums = torch.zeros(args.num_extrapol, device=fabric.device)
+    token_counts = torch.zeros(args.num_extrapol, device=fabric.device)
     for k, val_data in enumerate(val_dataloader):
         if k >= eval_iters:
             break
@@ -299,10 +333,21 @@ def validate(args, fabric: L.Fabric, model: torch.nn.Module, val_dataloader: Dat
             input_ids = val_data[:, 0 : length].contiguous()
             targets = val_data[:, 1 : length + 1].contiguous()
             logits = model(input_ids)
-            loss = chunked_cross_entropy(logits, targets, chunk_size=0)
-            losses[k,i] = loss.item()
+            logits = logits.reshape(-1, logits.size(-1))
+            targets = targets.reshape(-1)
+            valid_mask = targets != -1
 
-    out = losses.mean(0)
+            if valid_mask.any():
+                per_token_loss = F.cross_entropy(logits, targets, ignore_index=-1, reduction="none")
+                loss_sums[i] += per_token_loss[valid_mask].sum()
+                token_counts[i] += valid_mask.sum()
+
+    # Aggregate validation numerators and denominators across all ranks, so logged
+    # loss/ppl represent global validation statistics instead of rank-local values.
+    loss_sums = fabric.all_reduce(loss_sums, reduce_op="sum")
+    token_counts = fabric.all_reduce(token_counts, reduce_op="sum")
+    out = loss_sums / token_counts.clamp(min=1)
+
     model.train()
     return out
 
