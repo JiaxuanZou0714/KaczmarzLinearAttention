@@ -15,6 +15,7 @@ from typing import Optional, Tuple, Union
 import math
 import lightning as L
 import torch
+import torch.nn.functional as F
 from lightning.fabric.strategies import FSDPStrategy
 from torch.utils.data import DataLoader
 from functools import partial
@@ -24,7 +25,7 @@ from lit_gpt.model import GPT, Block, MBlock, Config
 from lit_gpt.packed_dataset import CombinedDataset, PackedDataset
 from lit_gpt.speed_monitor import SpeedMonitorFabric as Monitor
 from lit_gpt.speed_monitor import estimate_flops
-from lit_gpt.utils import chunked_cross_entropy, num_parameters
+from lit_gpt.utils import num_parameters
 from pytorch_lightning.loggers import WandbLogger
 from transformers import AutoTokenizer
 from lit_gpt import FusedCrossEntropyLoss
@@ -68,9 +69,13 @@ def main(args):
     fabric.logger.log_hyperparams(args)
     monitor = Monitor(fabric, window_size=2, time_unit="seconds", log_iter_interval=args.log_iter_interval)
 
+    resume_path = os.path.join(args.out_dir, "latest-model-ckpt.pth")
     if os.path.exists(args.out_dir):
-        args.resume = True
-        print('Resuming from {}'.format(args.out_dir))
+        args.resume = os.path.isfile(resume_path)
+        if args.resume:
+            print('Resuming from {}'.format(args.out_dir))
+        elif fabric.global_rank == 0:
+            fabric.print(f"Found existing output directory but no checkpoint at {resume_path}. Starting from scratch.")
     else:
         if fabric.global_rank == 0:
             os.makedirs(args.out_dir)
@@ -117,14 +122,13 @@ def main(args):
 
     if args.resume:
         try:
-            resume = os.path.join(args.out_dir, "latest-model-ckpt.pth")
             if fabric.global_rank == 0:
-                fabric.print(f"Resuming training from {resume}")
-            fabric.load(resume, state)
-            fabric.print(f"Successfully resumed from {resume}")
-        except:
-            fabric.print(f"Failed to resume from {resume}")
-            args.resume = False
+                fabric.print(f"Resuming training from {resume_path}")
+            fabric.load(resume_path, state)
+            fabric.print(f"Successfully resumed from {resume_path}")
+        except Exception as e:
+            fabric.print(f"Failed to resume from {resume_path}: {e!r}")
+            raise RuntimeError(f"Resume requested but loading checkpoint failed: {resume_path}") from e
     train_time = time.perf_counter()
     train(args, fabric, state, train_dataloader, val_dataloader, monitor, args.resume)
     if fabric.global_rank == 0:
@@ -290,7 +294,8 @@ def validate(args, fabric: L.Fabric, model: torch.nn.Module, val_dataloader: Dat
     fabric.print("Validating ...")
     model.eval()
 
-    losses = torch.zeros(eval_iters, args.num_extrapol, device=fabric.device)
+    loss_sums = torch.zeros(args.num_extrapol, device=fabric.device)
+    token_counts = torch.zeros(args.num_extrapol, device=fabric.device)
     for k, val_data in enumerate(val_dataloader):
         if k >= eval_iters:
             break
@@ -299,10 +304,21 @@ def validate(args, fabric: L.Fabric, model: torch.nn.Module, val_dataloader: Dat
             input_ids = val_data[:, 0 : length].contiguous()
             targets = val_data[:, 1 : length + 1].contiguous()
             logits = model(input_ids)
-            loss = chunked_cross_entropy(logits, targets, chunk_size=0)
-            losses[k,i] = loss.item()
+            logits = logits.reshape(-1, logits.size(-1))
+            targets = targets.reshape(-1)
+            valid_mask = targets != -1
 
-    out = losses.mean(0)
+            if valid_mask.any():
+                per_token_loss = F.cross_entropy(logits, targets, ignore_index=-1, reduction="none")
+                loss_sums[i] += per_token_loss[valid_mask].sum()
+                token_counts[i] += valid_mask.sum()
+
+    # Aggregate validation numerators and denominators across all ranks, so logged
+    # loss/ppl represent global validation statistics instead of rank-local values.
+    loss_sums = fabric.all_reduce(loss_sums, reduce_op="sum")
+    token_counts = fabric.all_reduce(token_counts, reduce_op="sum")
+    out = loss_sums / token_counts.clamp(min=1)
+
     model.train()
     return out
 
