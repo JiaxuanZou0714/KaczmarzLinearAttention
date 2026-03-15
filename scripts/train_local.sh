@@ -7,8 +7,8 @@ VALIDATION_DATA="${OUTPUT_ROOT}/mydata/slimpajama/validation"
 SAVE_DIR="/home/huiwei/jiaxuanzou/linear_attn/save_dir"
 
 # Experiment settings
-FULL_TRAIN_TOKENS=6405226567
-NAME="${NAME:-512x4k_fullSlimPajama_RelaxedKaczmarzQNorm_0.4B}"
+FULL_TRAIN_TOKENS=1000000000
+NAME="${NAME:-512x4k_1B_RelaxedKaczmarzQNorm_0.4B}"
 MODEL="${MODEL:-RelaxedKaczmarzQNorm_0.4B}"
 CONFIG="${CONFIG:-tsz512x4k}"
 EVAL_ITERS="${EVAL_ITERS:-15}"
