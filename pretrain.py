@@ -17,7 +17,7 @@ import lightning as L
 import torch
 from lightning.fabric.strategies import FSDPStrategy
 from torch.utils.data import DataLoader
-from functools import partial 
+from functools import partial
 wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 from lit_gpt.model import GPT, Block, MBlock, Config
@@ -40,14 +40,19 @@ os.environ["TRITON_CACHE_MANAGER"] = "cache:ParallelFileCacheManager"
 
 def main(args):
     if args.debug:
-        wandb_logger = WandbLogger(project="llm_next_gen", mode='disabled', name=args.exp_name, id=args.exp_name, save_dir=args.wandb_dir, dir=args.wandb_dir, version=args.exp_name, group="debug")
+        wandb_logger = WandbLogger(project="linear_attn", mode='disabled', name=args.exp_name, id=args.exp_name, save_dir=args.wandb_dir, dir=args.wandb_dir, version=args.exp_name, group="debug")
     else:
-        wandb_logger = WandbLogger(project="llm_next_gen", name=args.exp_name, id=args.exp_name, save_dir=args.wandb_dir, dir=args.wandb_dir, version=args.exp_name, group=args.exp_group)
-    if args.interactive_job:
-        strategy = FSDPStrategy(auto_wrap_policy={Block,MBlock}, state_dict_type="full")
+        wandb_logger = WandbLogger(project="linear_attn", name=args.exp_name, id=args.exp_name, save_dir=args.wandb_dir, dir=args.wandb_dir, version=args.exp_name, group=args.exp_group)
+    use_cuda = torch.cuda.is_available()
+    if use_cuda:
+        if args.interactive_job:
+            strategy = FSDPStrategy(auto_wrap_policy={Block,MBlock}, state_dict_type="full")
+        else:
+            strategy = FSDPStrategy(auto_wrap_policy={Block,MBlock}, state_dict_type="full", sharding_strategy='HYBRID_SHARD')
+        fabric = L.Fabric(devices=devices, strategy=strategy, precision="bf16-mixed", loggers=[wandb_logger])
     else:
-        strategy = FSDPStrategy(auto_wrap_policy={Block,MBlock}, state_dict_type="full", sharding_strategy='HYBRID_SHARD')
-    fabric = L.Fabric(devices=devices, strategy=strategy, precision="bf16-mixed", loggers=[wandb_logger])
+        strategy = "auto"
+        fabric = L.Fabric(devices=1, strategy=strategy, precision="32-true", loggers=[wandb_logger])
     fabric.launch()
     fabric.seed_everything(args.seed)
     fabric.print("##### Infra Details #####")
@@ -57,7 +62,7 @@ def main(args):
     fabric.print(f"Maximum number of training tokens: {args.max_tokens}")
     fabric.print(f"Micro batch size: {args.micro_batch_size}")
     fabric.print(f"Batch size: {args.batch_size}")
-         
+
     if fabric.global_rank == 0:
         fabric.print(args)
     fabric.logger.log_hyperparams(args)
@@ -73,7 +78,7 @@ def main(args):
             target_bash_scripts_save_dir = os.path.join(args.out_dir, 'bash_scripts')
             os.makedirs(target_litgpt_save_dir)
             os.makedirs(target_bash_scripts_save_dir)
-          
+
     config = Config.from_name(args.model_name)
     train_dataloader, val_dataloader = create_dataloaders(
         batch_size=args.micro_batch_size,
@@ -87,19 +92,21 @@ def main(args):
         train_dataloader = fabric.setup_dataloaders(train_dataloader)
     else:
         train_dataloader, val_dataloader = fabric.setup_dataloaders(train_dataloader, val_dataloader)
-        
+
     if fabric.global_rank == 0:
         fabric.print(f"Loading model with {config.__dict__}")
     t0 = time.perf_counter()
     with fabric.init_module(empty_init=False):
         model = GPT(config)
+        # Ensure all parameters are in float32 before FSDP wrapping to avoid mixed precision errors
+        model = model.to(torch.float32)
         model.apply(partial(model._init_weights ,n_layer=config.n_layer))
-    
+
     if fabric.global_rank == 0:
         fabric.print(f"Time to instantiate model: {time.perf_counter() - t0:.02f} seconds.")
         fabric.print(f"Total parameters {num_parameters(model.transformer.h):,}")
         fabric.print(model)
-    
+
     model = fabric.setup(model)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay, betas=(args.beta1, args.beta2), fused=True
@@ -131,7 +138,7 @@ def train(args, fabric, state, train_dataloader, val_dataloader, monitor, resume
     model = state["model"]
     optimizer = state["optimizer"]
     total_lengths = 0
-    total_t0 = time.perf_counter()    
+    total_t0 = time.perf_counter()
     max_tokens_per_device = args.max_tokens // fabric.world_size
     tokens_per_iter = args.micro_batch_size * model.config.block_size
     max_iters = max_tokens_per_device // tokens_per_iter
@@ -141,14 +148,42 @@ def train(args, fabric, state, train_dataloader, val_dataloader, monitor, resume
     loss_func = FusedCrossEntropyLoss()
     tokens = 0
     train_t0 = time.perf_counter()
-    
+
     if args.eval_before_training:
         fabric.print("Do validation before training:")
         val_loss = validate(args, fabric, model, val_dataloader, None)
         for i in range(args.num_extrapol):
             if fabric.global_rank == 0:
                 fabric.print(f"step {state['iter_num']} {i+1} x: val loss {val_loss[i]:.4f}")
-    
+
+    def run_validation(trigger_message: str, current_tokens: int | None = None):
+        if val_dataloader is None:
+            return
+
+        if fabric.global_rank == 0:
+            if current_tokens is None:
+                fabric.print(f"Triggering evaluation: {trigger_message}")
+            else:
+                fabric.print(f"Triggering evaluation at {current_tokens} tokens ({trigger_message})...")
+
+        t0_eval = time.perf_counter()
+        val_loss_all = validate(args, fabric, model, val_dataloader, args.eval_iters)
+        t1_eval = time.perf_counter() - t0_eval
+        monitor.eval_end(t1_eval)
+
+        if fabric.global_rank == 0 and current_tokens is not None:
+            val_loss_val = val_loss_all[0].item()
+            val_ppl = math.exp(val_loss_val)
+            fabric.print(f"Recorded metrics at {current_tokens} tokens: loss {val_loss_val:.4f}, ppl {val_ppl:.4f}")
+
+        for i in range(args.num_extrapol):
+            if fabric.global_rank == 0:
+                fabric.print(f"step {state['iter_num']} {i+1} x: val loss {val_loss_all[i]:.4f}, val time: {t1_eval * 1000:.2f}ms")
+                fabric.log_dict({"metric/val_loss@"+str(i+1)+"x": val_loss_all[i].item()}, state["step_count"])
+                fabric.log_dict({"metric/val_ppl@"+str(i+1)+"x": math.exp(val_loss_all[i].item())}, state["step_count"])
+
+        fabric.barrier()
+
     def save_checkpoint(final=False):
         name = 'latest' if not final else 'final'
         checkpoint_path = os.path.join(args.out_dir,f"{name}-model-ckpt.pth")
@@ -174,7 +209,7 @@ def train(args, fabric, state, train_dataloader, val_dataloader, monitor, resume
 
         if state["iter_num"] >= max_iters:
             break
-    
+
         iter_t0 = time.perf_counter()
         input_ids = train_data[:, 0 : model.config.block_size].contiguous()
         targets = train_data[:, 1 : model.config.block_size + 1].contiguous()
@@ -186,6 +221,8 @@ def train(args, fabric, state, train_dataloader, val_dataloader, monitor, resume
         is_accumulating = (state["iter_num"] + 1) % args.gradient_accumulation_steps != 0
         with fabric.no_backward_sync(model, enabled=is_accumulating):
             logits = model(input_ids)
+            logits = logits.view(-1, logits.size(-1))
+            targets = targets.view(-1)
             loss = loss_func(logits, targets)
             fabric.backward(loss / args.gradient_accumulation_steps)
 
@@ -203,13 +240,13 @@ def train(args, fabric, state, train_dataloader, val_dataloader, monitor, resume
             fabric.print(
                     f"iter {state['iter_num']} step {state['step_count']}: loss {loss.item():.4f}, iter time:"
                     f" {(t1 - iter_t0) * 1000:.2f}ms{' (optimizer.step)' if not is_accumulating else ''}"
-                    f" remaining time: {(t1 - total_t0) / (state['iter_num'] - initial_iter) * (max_iters - state['iter_num']) / 3600:.2f} hours. " 
+                    f" remaining time: {(t1 - total_t0) / (state['iter_num'] - initial_iter) * (max_iters - state['iter_num']) / 3600:.2f} hours. "
                     f" or {(t1 - total_t0) / (state['iter_num'] - initial_iter) * (max_iters - state['iter_num']) / 3600 / 24:.2f} days. "
                     f" total training throughput {tokens / (t1 - train_t0) / 1e3:.2f}K tokens/s per GPU."
                     f" total trained tokens: {total_tokens} B tokens"
                     f" peak memory allocate {torch.cuda.memory_stats(0)['allocated_bytes.all.peak'] / 1e9} GB"
-                )           
-            
+                )
+
         estimated_flops = 1
         monitor.on_train_batch_end(
             state["iter_num"] * args.micro_batch_size,
@@ -219,24 +256,32 @@ def train(args, fabric, state, train_dataloader, val_dataloader, monitor, resume
             flops_per_batch=estimated_flops,
             lengths=total_lengths,
             train_loss = loss.item()
-        )        
+        )
+
+        # Run validation at evenly spaced token milestones, e.g. 1%, 2%, ... of total tokens.
+        tokens_per_iter_global = model.config.block_size * args.micro_batch_size * fabric.world_size
+        current_tokens = state["iter_num"] * tokens_per_iter_global
+        prev_tokens = (state["iter_num"] - 1) * tokens_per_iter_global
+        if val_dataloader is not None and args.total_evals > 0:
+            completed_eval_milestones = current_tokens * args.total_evals // args.max_tokens
+            previous_eval_milestones = prev_tokens * args.total_evals // args.max_tokens
+            if completed_eval_milestones > previous_eval_milestones:
+                eval_progress = min(completed_eval_milestones, args.total_evals)
+                progress_pct = 100 * eval_progress / args.total_evals
+                run_validation(f"{progress_pct:.1f}% of training tokens", current_tokens)
 
         if not is_accumulating and state["step_count"] % args.save_step_interval == 0:
             save_checkpoint()
 
-        if val_dataloader is not None and not is_accumulating and state["step_count"] % args.eval_step_interval == 0:            
-            t0 = time.perf_counter()
-            val_loss = validate(args, fabric, model, val_dataloader, args.eval_iters)
-            t1 = time.perf_counter() - t0
-            monitor.eval_end(t1)
-            for i in range(args.num_extrapol):
-                if fabric.global_rank == 0:
-                    fabric.print(f"step {state['iter_num']} {i+1} x: val loss {val_loss[i]:.4f}, val time: {t1 * 1000:.2f}ms")        
-                    fabric.log_dict({"metric/val_loss@"+str(i+1)+"x": val_loss[i].item()}, state["step_count"])
-                    fabric.log_dict({"metric/val_ppl@"+str(i+1)+"x": math.exp(val_loss[i].item())}, state["step_count"])
+        if (
+            val_dataloader is not None
+            and args.total_evals <= 0
+            and args.eval_step_interval > 0
+            and not is_accumulating
+            and state["step_count"] % args.eval_step_interval == 0
+        ):
+            run_validation(f"optimizer step {state['step_count']}", current_tokens)
 
-            fabric.barrier()
-    
     save_checkpoint(final=True)
 
 
@@ -249,14 +294,14 @@ def validate(args, fabric: L.Fabric, model: torch.nn.Module, val_dataloader: Dat
     for k, val_data in enumerate(val_dataloader):
         if k >= eval_iters:
             break
-        
+
         for i, length in enumerate([2048, 4096]):
             input_ids = val_data[:, 0 : length].contiguous()
             targets = val_data[:, 1 : length + 1].contiguous()
             logits = model(input_ids)
             loss = chunked_cross_entropy(logits, targets, chunk_size=0)
             losses[k,i] = loss.item()
-        
+
     out = losses.mean(0)
     model.train()
     return out
@@ -348,7 +393,8 @@ if __name__ == "__main__":
     mp.set_start_method('spawn')
     devices = torch.cuda.device_count() or 1
     torch.set_float32_matmul_precision("high")
-    torch.backends.cudnn.benchmark = True
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
     parser = argparse.ArgumentParser(description='LLM Training')
     group = parser.add_argument_group('hyperparameters')
     group.add_argument('--output_root', default='', type=str, help='output root directory')
@@ -366,7 +412,7 @@ if __name__ == "__main__":
     group.add_argument('--interactive_job', action='store_true', default=False, help='debug flag')
     group.add_argument('--tokenizer_name', type=str, default='TinyLlama/TinyLlama_v1.1')
     group.add_argument('--learning_rate', type=float, default=4e-4, help='learning rate')
-    group.add_argument('--total_evals', type=int, default=400, help='total number of evals')
+    group.add_argument('--total_evals', type=int, default=0, help='number of token-progress evals spaced evenly over training; set to 0 to disable')
     group.add_argument('--eval_iters', type=int, default=10, help='number of evaluation iterations')
     group.add_argument('--log_step_interval', type=int, default=10, help='log_step_interval')
     group.add_argument('--save_step_interval', type=int, default=1000, help='save_step_interval')
@@ -382,6 +428,7 @@ if __name__ == "__main__":
     group.add_argument('--train_num_workers', type=int, default=8)
     group.add_argument('--val_num_workers', type=int, default=1)
     group.add_argument('--micro_batch_size', type=int, default=8, help='micro batch size')
+    group.add_argument('--max_tokens', type=int, default=None, help='max tokens')
 
     args = parser.parse_args()
     name = args.train_config +"_" + args.exp_name
@@ -390,12 +437,15 @@ if __name__ == "__main__":
 
     train_data_config = [("train_slim", 1.0)]
     val_data_config = [("validation", 1.0)]
-    nodes = int(os.getenv("SLURM_NNODES"))
+    _nnodes_env = os.getenv("SLURM_NNODES")
+    nodes = int(_nnodes_env) if _nnodes_env is not None else 1
     args.nodes = nodes
 
-    micro_batch_size = 8  
+    micro_batch_size = 8
 
-    if "20B" in name:
+    if args.max_tokens is not None:
+        max_tokens = args.max_tokens
+    elif "20B" in name:
         max_tokens = int(1e11) // 5
     elif "100B" in name:
         max_tokens = int(1e11)
@@ -407,17 +457,17 @@ if __name__ == "__main__":
         max_tokens = int(3e10) // 2
     else:
         raise ValueError("Unknown training token config")
-    
+
     if "512x4k" in name:
         micro_batch_size = 8
-        global_batch_size = 512 // nodes 
+        global_batch_size = 512 // nodes
     elif "1024x4k" in name:
         micro_batch_size = 8
         global_batch_size = 1024 // nodes
 
     elif "256x8k" in name:
         global_batch_size = 256 // nodes
-        micro_batch_size = 8 
+        micro_batch_size = 8
 
     elif "128x16k" in name:
         global_batch_size = 128 // nodes
@@ -425,15 +475,15 @@ if __name__ == "__main__":
 
     elif "64x32k" in name:
         global_batch_size = 64 // nodes
-        micro_batch_size = 2 
-        
+        micro_batch_size = 2
+
     elif "1024x2k" in name:
         global_batch_size = 1024 // nodes
         micro_batch_size = 32
-    
+
     if "1.3B" in name:
-        micro_batch_size = 4 
-    
+        micro_batch_size = 4
+
     micro_batch_size = max(1, micro_batch_size)
     args.min_lr = args.learning_rate / 10
     args.batch_size = global_batch_size // devices

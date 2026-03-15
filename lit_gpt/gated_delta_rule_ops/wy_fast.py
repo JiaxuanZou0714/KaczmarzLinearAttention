@@ -10,7 +10,7 @@ import torch
 import triton
 import triton.language as tl
 from einops import rearrange
-from torch.cuda.amp import custom_bwd, custom_fwd
+from torch.amp import custom_bwd, custom_fwd
 from fla.utils import contiguous
 
 # Inspired by "THE WY REPRESENTATION FOR PRODUCTS OF HOUSEHOLDER MATRICES" https://epubs.siam.org/doi/pdf/10.1137/0908009
@@ -570,7 +570,7 @@ def bwd_prepare_wy_repr(k, v, beta, g, A_w, A_u, A_w_original, A_u_original, dw,
 class WYRepresentationPrepration(torch.autograd.Function):
     @staticmethod
     @contiguous
-    @custom_fwd
+    @custom_fwd(device_type='cuda')
     def forward(ctx, k, v, beta, chunk_size):
         ctx.BT = chunk_size
         w, u, A = fwd_prepare_wy_repr(k, v, beta,  ctx.BT)
@@ -579,7 +579,7 @@ class WYRepresentationPrepration(torch.autograd.Function):
 
     @staticmethod
     @contiguous
-    @custom_bwd
+    @custom_bwd(device_type='cuda')
     def backward(ctx, dw, du):
         k, v, beta, A = ctx.saved_tensors
         BT = ctx.BT

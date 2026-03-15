@@ -285,7 +285,7 @@ class Block(nn.Module):
         self.norm_1 = config.norm_class(config.n_embd, eps=config.norm_eps)
         self.use_gated_deltanet = layer_idx % config.gated_delta_per_layer == 0 if config.gated_delta_per_layer >0 else False              
         if self.use_gated_deltanet:
-            self.attn = GatedDeltaNet(hidden_size=config.n_embd)      
+            self.attn = GatedDeltaNet(hidden_size=config.n_embd, qk_norm=config.qk_norm, num_heads=config.n_head)      
         else:
             self.attn = CausalSelfAttention(config, n_embd= config.n_embd, layer_idx= layer_idx, )
         if not config.shared_attention_norm and config.mlp and not config.parallel_residual:

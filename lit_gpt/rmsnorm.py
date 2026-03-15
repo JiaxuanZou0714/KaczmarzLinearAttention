@@ -5,7 +5,11 @@
 # Adapted from https://github.com/NVIDIA/apex/blob/master/apex/contrib/layer_norm/layer_norm.py AND https://github.com/Dao-AILab/flash-attention/blob/7a983df74215e035e566e37125b0a71e3618f39d/flash_attn/ops/layer_norm.py#L16
 
 import torch
-import dropout_layer_norm
+try:
+    import dropout_layer_norm
+except ImportError:
+    dropout_layer_norm = None
+
 import torch
 from torch.nn import init
 
@@ -658,6 +662,64 @@ class DropoutAddLayerNormParallelResidualFn(torch.autograd.Function):
         )
 
 
+def dropout_add_layer_norm_manual(
+    x0,
+    residual,
+    weight,
+    bias,
+    dropout_p,
+    epsilon,
+    rowscale=None,
+    layerscale=None,
+    prenorm=False,
+    residual_in_fp32=False,
+    return_dropout_mask=False,
+    is_rms_norm=False
+):
+    # Dropout
+    dmask = None
+    if dropout_p > 0.0:
+        if return_dropout_mask:
+            dmask = (torch.rand_like(x0) > dropout_p).to(dtype=torch.uint8)
+            x0 = x0 * dmask / (1.0 - dropout_p)
+        else:
+            x0 = torch.nn.functional.dropout(x0, p=dropout_p, training=True)
+
+    # Residual
+    if residual is not None:
+        if residual_in_fp32:
+            residual = residual.float()
+        x = x0 + residual.to(x0.dtype)
+    else:
+        x = x0
+
+    # Norm
+    if is_rms_norm:
+        dtype = x.dtype
+        x_f = x.float()
+        norm_x = torch.mean(x_f * x_f, dim=-1, keepdim=True)
+        x_normed = x_f * torch.rsqrt(norm_x + epsilon)
+        out = weight * x_normed.to(dtype)
+        if bias is not None:
+            out = out + bias
+    else:
+        out = torch.nn.functional.layer_norm(x, x.shape[-1:], weight, bias, epsilon)
+
+    # Return
+    if not return_dropout_mask:
+        if prenorm:
+            return out, x
+        else:
+            return out
+    else:
+        if dmask is None:
+             dmask = torch.ones(x0.shape, dtype=torch.uint8, device=x0.device)
+        if prenorm:
+            return out, x, dmask
+        else:
+            return out, dmask
+
+
 def layer_norm(x, weight, bias, epsilon):
     return DropoutAddLayerNormFn.apply(x, None, weight, bias, None, None, 0.0, epsilon, False)
 
@@ -678,6 +740,21 @@ def dropout_add_layer_norm(
     """residual_in_fp32 only has an effect if residual is None.
     Otherwise residual dtype is residual.dtype.
     """
+    if dropout_layer_norm is None:
+        return dropout_add_layer_norm_manual(
+            x0,
+            residual,
+            weight,
+            bias,
+            dropout_p,
+            epsilon,
+            rowscale,
+            layerscale,
+            prenorm,
+            residual_in_fp32,
+            return_dropout_mask,
+            is_rms_norm=False
+        )
     return DropoutAddLayerNormFn.apply(
         x0,
         residual,
@@ -804,6 +881,10 @@ class DropoutAddLayerNorm(torch.nn.Module):
         )
         
 def rms_norm(x, weight, epsilon):
+    if dropout_layer_norm is None:
+        norm_x = torch.mean(x * x, dim=-1, keepdim=True)
+        x_normed = x * torch.rsqrt(norm_x + epsilon)
+        return weight * x_normed
     return DropoutAddLayerNormFn.apply(
         x, None, weight, None, None, None, 0.0, epsilon, False, False, True
     )

@@ -16,19 +16,78 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
-from fla.modules import FusedRMSNormSwishGate, RMSNorm, ShortConvolution
-from fla.modules.activations import ACT2FN
-from fla.ops.simple_gla import chunk_simple_gla
+try:
+    from fla.modules import FusedRMSNormSwishGate, RMSNorm, ShortConvolution
+    from fla.modules.activations import ACT2FN
+    from fla.ops.simple_gla import chunk_simple_gla
+    from fla.modules.l2norm import l2_norm as l2_norm_fn
+except ImportError:
+    # Mock implementations for when fla is not available
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    ACT2FN = {
+        'swish': nn.SiLU(),
+        'silu': nn.SiLU(),
+        'gelu': nn.GELU(),
+        'relu': nn.ReLU(),
+    }
+
+    class RMSNorm(nn.Module):
+        def __init__(self, hidden_size, eps=1e-6, elementwise_affine=True):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(hidden_size))
+            self.variance_epsilon = eps
+        def forward(self, hidden_states):
+            input_dtype = hidden_states.dtype
+            hidden_states = hidden_states.to(torch.float32)
+            variance = hidden_states.pow(2).mean(-1, keepdim=True)
+            hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+            return self.weight * hidden_states.to(input_dtype)
+
+    class FusedRMSNormSwishGate(nn.Module):
+        def __init__(self, hidden_size, elementwise_affine=True, eps=1e-5):
+            super().__init__()
+            self.norm = RMSNorm(hidden_size, eps=eps, elementwise_affine=elementwise_affine)
+            self.act = nn.SiLU()
+        def forward(self, x, gate):
+            return self.norm(x) * self.act(gate)
+
+    class ShortConvolution(nn.Module):
+        def __init__(self, hidden_size, kernel_size, activation=None, bias=False, **kwargs):
+            super().__init__()
+            self.conv = nn.Conv1d(hidden_size, hidden_size, kernel_size, groups=hidden_size, padding=kernel_size-1, bias=bias)
+            self.activation = activation
+            if activation in ['silu', 'swish']:
+                self.act = nn.SiLU()
+            else:
+                self.act = None
+            self.kernel_size = kernel_size
+            self.state_size = hidden_size * kernel_size
+
+        def forward(self, x, mask=None, cache=None):
+            # x: [b, l, d]
+            b, l, d = x.shape
+            x_t = x.transpose(1, 2)
+            out = self.conv(x_t)
+            out = out[..., :l]
+            out = out.transpose(1, 2)
+            if self.act:
+                out = self.act(out)
+            return out, None
+
+    def l2_norm_fn(x, dim=-1):
+        return F.normalize(x, p=2, dim=dim)
+
 from .gated_delta_rule_ops import chunk_gated_delta_rule
-import math 
+import math
 
 if TYPE_CHECKING:
-    from fla.models.utils import Cache
-
-try:
-    from fla.modules.l2norm import l2_norm as l2_norm_fn
-except:
-    from fla.modules.l2norm import l2_norm_fn
+    try:
+        from fla.models.utils import Cache
+    except ImportError:
+        from typing import Any
+        Cache = Any
 
 class GatedDeltaNet(nn.Module):
     def __init__(
@@ -55,7 +114,7 @@ class GatedDeltaNet(nn.Module):
     ) -> GatedDeltaNet:
         super().__init__()
         self.qk_norm = qk_norm
-        assert self.qk_norm in ['l2', 'longhorn', 'softmax']
+        assert self.qk_norm in ['l2', 'longhorn', 'softmax', 'kaczmarz', 'relaxed_kaczmarz', 'relaxed_kaczmarz_q_norm']
 
         self.use_mva = use_mva
 
@@ -147,9 +206,9 @@ class GatedDeltaNet(nn.Module):
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
-        q = self.q_conv1d(q, attention_mask, conv_state_q)
-        k = self.k_conv1d(k, attention_mask, conv_state_k)
-        v = self.v_conv1d(v, attention_mask, conv_state_v)
+        q, _ = self.q_conv1d(q, mask=attention_mask, cache=conv_state_q)
+        k, _ = self.k_conv1d(k, mask=attention_mask, cache=conv_state_k)
+        v, _ = self.v_conv1d(v, mask=attention_mask, cache=conv_state_v)
         # dealing with left-padding
         if attention_mask is not None:
             v = v.mul_(attention_mask.unsqueeze(-1))
@@ -178,6 +237,13 @@ class GatedDeltaNet(nn.Module):
             q = q.softmax(dim=-1).to(v)
         elif self.qk_norm == 'longhorn':            
             beta = beta / (1 + beta * (k * k).sum(-1))
+        elif self.qk_norm == 'kaczmarz':
+            beta = 1 / ((k * k).sum(-1) + 1e-6)
+        elif self.qk_norm == 'relaxed_kaczmarz':
+            beta = beta / ((k * k).sum(-1) + 1e-6)
+        elif self.qk_norm == 'relaxed_kaczmarz_q_norm':
+            beta = beta / ((k * k).sum(-1) + 1e-6)
+            q = l2_norm_fn(q).to(v)
         else:
             raise KeyError
         if self.use_input_gate:
