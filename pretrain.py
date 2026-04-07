@@ -59,9 +59,9 @@ def find_resume_checkpoint(out_dir: str) -> str | None:
 
 def main(args):
     if args.debug:
-        wandb_logger = WandbLogger(project="linear_attn", mode='disabled', name=args.exp_name, id=args.exp_name, save_dir=args.wandb_dir, dir=args.wandb_dir, version=args.exp_name, group="debug")
+        wandb_logger = WandbLogger(project=os.environ.get("WANDB_PROJECT", "linear_attn"), mode='disabled', name=args.exp_name, id=args.exp_name, save_dir=args.wandb_dir, dir=args.wandb_dir, version=args.exp_name, group="debug")
     else:
-        wandb_logger = WandbLogger(project="linear_attn", name=args.exp_name, id=args.exp_name, save_dir=args.wandb_dir, dir=args.wandb_dir, version=args.exp_name, group=args.exp_group)
+        wandb_logger = WandbLogger(project=os.environ.get("WANDB_PROJECT", "linear_attn"), name=args.exp_name, id=args.exp_name, save_dir=args.wandb_dir, dir=args.wandb_dir, version=args.exp_name, group=args.exp_group)
     use_cuda = torch.cuda.is_available()
     if use_cuda:
         if args.interactive_job:

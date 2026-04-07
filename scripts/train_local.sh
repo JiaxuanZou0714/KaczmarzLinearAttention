@@ -7,9 +7,10 @@ VALIDATION_DATA="${OUTPUT_ROOT}/mydata/slimpajama/validation"
 SAVE_DIR="/home/huiwei/jiaxuanzou/linear_attn/save_dir"
 
 # Experiment settings
-FULL_TRAIN_TOKENS=100000000
-NAME="${NAME:-512x4k_100M_RelaxedKaczmarzQNorm_0.4B}"
-MODEL="${MODEL:-RelaxedKaczmarzQNorm_0.4B}"
+FULL_TRAIN_TOKENS=1000000000
+NAME="${NAME:-512x4k_1B_Kaczmarz_0.4B}"
+MODEL="${MODEL:-Kaczmarz_0.4B}"
+SEED="${SEED:-42}"
 CONFIG="${CONFIG:-tsz512x4k}"
 EVAL_ITERS="${EVAL_ITERS:-15}"
 TOTAL_EVALS="${TOTAL_EVALS:-100}"
@@ -28,6 +29,7 @@ export TRITON_CACHE_DIR="${TRI_CACHE_DIR}"
 export LD_LIBRARY_PATH=/home/huiwei/miniconda3/envs/jiaxuanzou/lib:$LD_LIBRARY_PATH
 unset WANDB_DISABLED
 export WANDB_MODE=online
+export WANDB_PROJECT="linear-attn-new" # 可以在这里修改为你想要的 wandb project 名称
 export WANDB_DIR="${WANDB_DIR}"
 
 # Create directories
@@ -60,4 +62,5 @@ ${PYTHON_BIN} -u ${OUTPUT_ROOT}/pretrain.py \
     --eval_step_interval ${EVAL_STEP_INTERVAL} \
     --learning_rate ${LR} \
     --micro_batch_size ${MICRO_BATCH_SIZE} \
-    --max_tokens ${MAX_TOKENS}
+    --max_tokens ${MAX_TOKENS} \
+    --seed ${SEED}
