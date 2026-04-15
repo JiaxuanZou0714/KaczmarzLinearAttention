@@ -43,6 +43,15 @@ if [[ "${MODEL}" == GLA* ]]; then
   }
 fi
 
+# Fail fast if Mamba2 dependencies are missing.
+if [[ "${MODEL}" == Mamba2* ]]; then
+  ${PYTHON_BIN} -c "from mamba_ssm.modules.mamba2 import Mamba2; from mamba_ssm.ops.triton.layer_norm import RMSNorm; from causal_conv1d import causal_conv1d_fn" >/dev/null 2>&1 || {
+    echo "ERROR: MODEL=${MODEL} requires mamba-ssm and causal-conv1d, but imports failed."
+    echo "Please install in jiaxuanzou env: conda run -n jiaxuanzou python -m pip install -U mamba-ssm causal-conv1d"
+    exit 1
+  }
+fi
+
 # Create directories
 mkdir -p ${LOGS_DIR}
 mkdir -p ${WANDB_DIR}

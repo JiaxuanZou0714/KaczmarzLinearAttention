@@ -10,6 +10,8 @@ from torch.utils.data import DataLoader
 from functools import partial
 import os
 import argparse
+import json
+import re
 # import wandb
 import numpy as np
 
@@ -21,7 +23,76 @@ from lit_gpt.model import GPT, Block, MBlock, Config
 from lit_gpt.utils import num_parameters
 from pytorch_lightning.loggers import WandbLogger
 from lit_gpt import FusedCrossEntropyLoss
-from mqar_data import MQARDataset
+from mqar_data import MQARDataset, generate_mqar_data
+
+
+def parse_extrapolation_factors(factors: str) -> list[int]:
+    parsed = []
+    for token in factors.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        value = int(token)
+        if value < 1:
+            raise ValueError(f"Invalid extrapolation factor {value}. Factors must be >= 1.")
+        parsed.append(value)
+
+    if not parsed:
+        parsed = [1]
+    if 1 not in parsed:
+        parsed.append(1)
+
+    return sorted(set(parsed))
+
+
+def infer_seq_and_key_len_from_data_dir(data_dir: str) -> Tuple[Optional[int], Optional[int]]:
+    match = re.search(r"seq(\d+)_key(\d+)", data_dir)
+    if not match:
+        return None, None
+    return int(match.group(1)), int(match.group(2))
+
+
+def build_extrapolation_val_loader(
+    fabric,
+    args,
+    seq_len: int,
+    key_len: int,
+    num_examples: int,
+    factor: int,
+):
+    cache_root = args.extrapol_cache_dir or os.path.join(args.data_dir, "extrapolation_cache")
+    cache_path = os.path.join(
+        cache_root,
+        (
+            f"val_seq{seq_len}_key{key_len}_pairs{args.num_pairs}"
+            f"_seed{args.seed + 1000 + factor}_n{num_examples}.npz"
+        ),
+    )
+
+    if fabric.global_rank == 0 and not os.path.exists(cache_path):
+        os.makedirs(cache_root, exist_ok=True)
+        extrapol_data = generate_mqar_data(
+            num_examples=num_examples,
+            seq_len=seq_len,
+            key_len=key_len,
+            num_pairs=args.num_pairs,
+            seed=args.seed + 1000 + factor,
+        )
+        np.savez_compressed(cache_path, **extrapol_data)
+        fabric.print(f"Generated extrapolation val data at {cache_path}")
+
+    fabric.barrier()
+
+    val_dataset = MQARDataset(data_path=cache_path)
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+    val_dataloader = fabric.setup_dataloaders(val_dataloader)
+    return val_dataloader
 
 def main(args):
     # Setup Logger
@@ -50,9 +121,25 @@ def main(args):
     val_dataset = MQARDataset(data_path=os.path.join(args.data_dir, "val.npz"))
     test_dataset = MQARDataset(data_path=os.path.join(args.data_dir, "test.npz"))
 
-    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
-    test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    inferred_seq_len, inferred_key_len = infer_seq_and_key_len_from_data_dir(args.data_dir)
+    train_seq_len = int(train_dataset.input_ids.shape[1])
+    base_eval_seq_len = args.extrapol_base_seq_len or inferred_seq_len or train_seq_len
+    eval_key_len = args.extrapol_key_len or inferred_key_len or 1
+    extrapolation_factors = parse_extrapolation_factors(args.extrapolation_factors)
+    extrapol_num_val = args.extrapol_num_val if args.extrapol_num_val > 0 else len(val_dataset)
+
+    if fabric.global_rank == 0:
+        fabric.print(
+            (
+                f"Final extrapolation validation setup: factors={extrapolation_factors}, "
+                f"base_seq_len={base_eval_seq_len}, key_len={eval_key_len}, "
+                f"num_val_examples={extrapol_num_val}"
+            )
+        )
+
+    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
+    val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+    test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
     train_dataloader, val_dataloader, test_dataloader = fabric.setup_dataloaders(train_dataloader, val_dataloader, test_dataloader)
 
@@ -101,16 +188,35 @@ def main(args):
         checkpoint = torch.load(best_model_path)
         model.load_state_dict(checkpoint["model"])
 
+        final_val_acc = {}
+        for factor in extrapolation_factors:
+            if factor == 1:
+                eval_loader = val_dataloader
+            else:
+                eval_loader = build_extrapolation_val_loader(
+                    fabric=fabric,
+                    args=args,
+                    seq_len=base_eval_seq_len * factor,
+                    key_len=eval_key_len,
+                    num_examples=extrapol_num_val,
+                    factor=factor,
+                )
+
+            acc = validate(fabric, model, eval_loader)
+            final_val_acc[f"{factor}x"] = float(acc)
+            fabric.log_dict({f"val/final_acc@{factor}x": float(acc)})
+            fabric.print(f"Final Val Acc @{factor}x: {acc:.4f}")
+
         test_acc = validate(fabric, model, test_dataloader)
         fabric.print(f"Test Acc: {test_acc:.4f}")
         fabric.log_dict({"test/acc": test_acc})
 
         # Save results to JSON
-        import json
         results = {
             "model_name": args.model_name,
             "test_acc": float(test_acc),
             "best_val_acc": float(state["best_val_acc"]),
+            "final_val_acc": final_val_acc,
             "args": vars(args)
         }
         if fabric.global_rank == 0:
@@ -217,8 +323,8 @@ def train(fabric, state, train_dataloader, val_dataloader, loss_func, args):
 @torch.no_grad()
 def validate(fabric, model, dataloader):
     model.eval()
-    total_correct = 0
-    total_masked = 0
+    total_correct = torch.tensor(0.0, device=fabric.device)
+    total_masked = torch.tensor(0.0, device=fabric.device)
 
     for batch in dataloader:
         input_ids = batch['input_ids']
@@ -230,8 +336,8 @@ def validate(fabric, model, dataloader):
         mask = labels != -100
         correct = (preds == labels) & mask
 
-        total_correct += correct.sum().item()
-        total_masked += mask.sum().item()
+        total_correct += correct.sum()
+        total_masked += mask.sum()
 
     model.train()
 
@@ -239,7 +345,9 @@ def validate(fabric, model, dataloader):
     total_correct = fabric.all_reduce(total_correct, reduce_op="sum")
     total_masked = fabric.all_reduce(total_masked, reduce_op="sum")
 
-    return total_correct / total_masked if total_masked > 0 else 0.0
+    if total_masked.item() > 0:
+        return (total_correct / total_masked).item()
+    return 0.0
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -252,13 +360,21 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=0.1)
-    parser.add_argument("--max_steps", type=int, default=6000)
+    parser.add_argument("--max_steps", type=int, default=10000)
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--val_interval", type=int, default=200)
     parser.add_argument("--save_interval", type=int, default=1000)
     parser.add_argument("--early_stop_patience", type=int, default=10)
+    parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--devices", type=int, default=1)
     parser.add_argument("--debug", action="store_true")
+
+    parser.add_argument("--extrapolation_factors", type=str, default="1,2,4,8")
+    parser.add_argument("--extrapol_num_val", type=int, default=2000)
+    parser.add_argument("--extrapol_base_seq_len", type=int, default=None)
+    parser.add_argument("--extrapol_key_len", type=int, default=None)
+    parser.add_argument("--extrapol_cache_dir", type=str, default=None)
+    parser.add_argument("--num_pairs", type=int, default=32)
 
     # Model overrides
     parser.add_argument("--n_embd", type=int, default=None)

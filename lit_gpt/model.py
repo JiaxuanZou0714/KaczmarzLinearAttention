@@ -20,7 +20,14 @@ from .fused_rotary_embedding import apply_rotary_emb_func
 from torch import Tensor
 from functools import partial
 try:
-    from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
+    from mamba_ssm.modules.mamba2 import Mamba2
+except ImportError:
+    try:
+        from mamba_ssm import Mamba2
+    except ImportError:
+        Mamba2 = None
+try:
+    from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn, rms_norm_fn
 except ImportError:
     RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
 from einops import rearrange
@@ -50,8 +57,13 @@ def create_block(
 ):
     if ssm_cfg is None:
         ssm_cfg = {}
+    if Mamba2 is None:
+        raise ImportError(
+            "Mamba2 model requested but mamba_ssm is not available. "
+            "Install mamba-ssm in the active environment."
+        )
     factory_kwargs = {"device": device, "dtype": dtype}
-    mixer_cls = partial(Mamba, layer_idx=layer_idx, **ssm_cfg, **factory_kwargs)
+    mixer_cls = partial(Mamba2, layer_idx=layer_idx, **ssm_cfg, **factory_kwargs)
     norm_cls = partial(
         nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon, **factory_kwargs
     )
@@ -98,8 +110,8 @@ class GPT(nn.Module):
                         **factory_kwargs,
                     )
                 )
-            )            
-            
+            )
+
         else:
             self.transformer = nn.ModuleDict(
                 dict(
@@ -108,7 +120,7 @@ class GPT(nn.Module):
                     ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
                 )
             )
-        
+
         self.rope_cache: Optional[RoPECache] = None
         self.mask_cache: Optional[torch.Tensor] = None
         self.kv_caches: List[KVCache] = []
@@ -116,7 +128,7 @@ class GPT(nn.Module):
         self.mamba_init = config.mamba or config.mamba_init
         if self.mamba_init:
             self.tie_weights()
-        
+
     def _init_weights(self, module: nn.Module, n_layer) -> None:
         """Meant to be used with `gpt.apply(gpt._init_weights)`."""
         # GPT-NeoX  https://arxiv.org/pdf/2204.06745.pdf
@@ -129,14 +141,14 @@ class GPT(nn.Module):
             if self.mamba_init:
                 if module.bias is not None:
                     if not getattr(module.bias, "_no_reinit", False):
-                        nn.init.zeros_(module.bias)    
+                        nn.init.zeros_(module.bias)
             else:
                 torch.nn.init.normal_(module.weight, mean=0.0, std=math.sqrt(2.0 / 5 / self.config.n_embd))
                 if module.bias is not None:
                     torch.nn.init.zeros_(module.bias)
-        # GPT-NeoX       
+        # GPT-NeoX
         for name, p in module.named_parameters():
-            if name in ["out_proj.weight", "fc2.weight"] or (name == "proj.weight" and isinstance(module, LLaMAMLP)) or (name == "w3.weight" and isinstance(module, SwiGLU) or (name=="proj.weight" and isinstance(module, CausalSelfAttention))):  #if use xformer swiglu, fc2 layer will be renamed to w3             
+            if name in ["out_proj.weight", "fc2.weight"] or (name == "proj.weight" and isinstance(module, LLaMAMLP)) or (name == "w3.weight" and isinstance(module, SwiGLU) or (name=="proj.weight" and isinstance(module, CausalSelfAttention))):  #if use xformer swiglu, fc2 layer will be renamed to w3
                 if self.mamba_init:
                     n_residuals_per_layer = 1 if self.config.mamba or not self.config.mlp else 2
                     nn.init.kaiming_uniform_(p, a=math.sqrt(5))
@@ -147,8 +159,8 @@ class GPT(nn.Module):
 
     def tie_weights(self):
         self.lm_head.weight = self.transformer.wte.weight
-        
-    
+
+
     def reset_cache(self) -> None:
         self.max_len = self.config.block_size
         self.kv_caches.clear()
@@ -183,7 +195,7 @@ class GPT(nn.Module):
                     prenorm=False,
                     residual_in_fp32=self.config.residual_in_fp32,
                 )
-            return self.lm_head(hidden_states) 
+            return self.lm_head(hidden_states)
 
         B, T = idx.size()
         use_kv_cache = input_pos is not None
@@ -203,13 +215,13 @@ class GPT(nn.Module):
             elif T> self.max_len:
                 self.max_len = T
                 self.rope_cache = self.build_rope_cache(idx, self.max_len)
-            cos, sin = self.rope_cache   
+            cos, sin = self.rope_cache
         # passing `attn_mask` to SDPA downgrades it to use the inefficient implementation. since we only need the mask
         # for the kv-cache support (only during inference), we only create it in that situation
         # this will be resolved by https://github.com/pytorch/pytorch/issues/96099
         if use_kv_cache and self.mask_cache is None:
             self.mask_cache = self.build_mask_cache(idx)
-        
+
         if use_kv_cache:
             if not self.config.nope:
                 cos = cos.index_select(0, input_pos)
@@ -227,7 +239,7 @@ class GPT(nn.Module):
             rope = (cos, sin)
         # forward the model itself
         x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
-            
+
         if not use_kv_cache:
             for block in self.transformer.h:
                 x, *_ = block(x, rope, max_seq_length)
@@ -348,7 +360,12 @@ class Block(nn.Module):
         if self.use_gated_deltanet and self.use_gla:
             raise ValueError("`gated_delta_per_layer` and `gla_per_layer` cannot be active on the same layer.")
         if self.use_gated_deltanet:
-            self.attn = GatedDeltaNet(hidden_size=config.n_embd, qk_norm=config.qk_norm, num_heads=config.n_head)
+            self.attn = GatedDeltaNet(
+                hidden_size=config.n_embd,
+                qk_norm=config.qk_norm,
+                num_heads=config.n_head,
+                use_mamba_gate=config.use_mamba_gate,
+            )
         elif self.use_gla:
             self.attn = SimpleGLA(config, n_embd=config.n_embd)
         else:
@@ -358,7 +375,7 @@ class Block(nn.Module):
         if config.mlp:
             self.mlp = config.mlp_class(config,)
         self.config = config
-        
+
     def forward(
         self,
         x: torch.Tensor,
@@ -370,13 +387,13 @@ class Block(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
 
         n_1 = self.norm_1(x)
-    
+
         if self.use_gated_deltanet:
             h, _ , new_kv_cache = self.attn(n_1, attention_mask=mask)
         elif self.use_gla:
             h, new_kv_cache = self.attn(n_1, rope, max_seq_length, mask, input_pos, kv_cache)
         else:
-            h, new_kv_cache = self.attn(n_1, rope, max_seq_length, mask, input_pos, kv_cache)   
+            h, new_kv_cache = self.attn(n_1, rope, max_seq_length, mask, input_pos, kv_cache)
         if self.config.parallel_residual:
             assert self.config.shared_attention_norm
             if self.config.mlp:
@@ -457,7 +474,7 @@ class CausalSelfAttention(nn.Module):
         if head_size is not None:
             self.head_size = head_size
             self.n_head =  n_embd // head_size
-            self.n_query_groups = self.n_head 
+            self.n_query_groups = self.n_head
         else:
             self.head_size = config.head_size
             self.n_head = config.n_head
@@ -496,7 +513,7 @@ class CausalSelfAttention(nn.Module):
                 kernel_size=d_conv,
                 groups= self.kv_dim,
                 padding=d_conv - 1,
-            ) 
+            )
 
     def forward(
         self,
@@ -519,8 +536,8 @@ class CausalSelfAttention(nn.Module):
         # split batched computation into three
         q, k, v = qkv.split((q_per_kv, 1, 1), dim=-2)
         q = q.reshape(B,  T, -1 )  # (B, T, nh_q, hs)
-        k = k.reshape(B,  T, -1 )  
-        v = v.reshape(B,  T, -1 )  
+        k = k.reshape(B,  T, -1 )
+        v = v.reshape(B,  T, -1 )
         if self.sc:
             q = causal_conv1d_fn(
                         x = q.transpose(-1,-2),
@@ -539,13 +556,13 @@ class CausalSelfAttention(nn.Module):
                         weight=rearrange(self.v_conv1d.weight, "d 1 w -> d w"),
                         bias=self.v_conv1d.bias,
                         activation="silu",
-                    ).transpose(-1,-2) 
+                    ).transpose(-1,-2)
 
         q = q.reshape(B,  T, -1, self.head_size)  # (B, T, nh_q, hs)
-        k = k.reshape(B,  T, -1, self.head_size)  
+        k = k.reshape(B,  T, -1, self.head_size)
         v = v.reshape(B,  T, -1, self.head_size)
 
-        if not self.config.nope:         
+        if not self.config.nope:
             cos, sin = rope
             # apply rope in fp32 significanly stabalize training
             # fused rope expect (batch_size, seqlen, nheads, headdim)
@@ -578,7 +595,7 @@ class CausalSelfAttention(nn.Module):
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None
     ):
         scale = 1.0 / math.sqrt(self.head_size)
-        
+
         if (
             FlashAttention2Available
             and mask is None
@@ -638,6 +655,3 @@ def build_rope_cache(
     if dtype in (torch.float16, torch.bfloat16, torch.int8):
         return cos.half(), sin.half()
     return cos, sin
-
-
-    
