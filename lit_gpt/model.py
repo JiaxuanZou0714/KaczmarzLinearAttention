@@ -28,6 +28,11 @@ import torch.nn.functional as F
 
 from causal_conv1d import causal_conv1d_fn
 
+try:
+    from fla.ops.simple_gla import chunk_simple_gla
+except ImportError:
+    chunk_simple_gla = None
+
 RoPECache = Tuple[torch.Tensor, torch.Tensor]
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 FlashAttention2Available = RequirementCache("flash-attn>=2.0.0.post1")
@@ -279,13 +284,73 @@ class GPT(nn.Module):
         ]
 
 
+class SimpleGLA(nn.Module):
+    """Minimal GLA block using FLA's `chunk_simple_gla` kernel for training-time baselines."""
+
+    def __init__(self, config: Config, n_embd: int) -> None:
+        super().__init__()
+        self.config = config
+        self.n_head = config.n_head
+        self.head_size = config.head_size
+        self.gate_logit_normalizer = 16
+        self.q_proj = nn.Linear(n_embd, n_embd, bias=config.bias)
+        self.k_proj = nn.Linear(n_embd, n_embd, bias=config.bias)
+        self.v_proj = nn.Linear(n_embd, n_embd, bias=config.bias)
+        self.gk_proj = nn.Linear(n_embd, self.n_head, bias=True)
+        self.proj = nn.Linear(n_embd, n_embd, bias=config.bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        rope: RoPECache,
+        max_seq_length: int,
+        mask: Optional[torch.Tensor] = None,
+        input_pos: Optional[torch.Tensor] = None,
+        kv_cache: Optional[KVCache] = None,
+    ) -> Tuple[torch.Tensor, Optional[KVCache]]:
+        del max_seq_length, mask, kv_cache
+        if input_pos is not None:
+            raise NotImplementedError("SimpleGLA currently only supports full-sequence training forward.")
+        if chunk_simple_gla is None:
+            raise ImportError(
+                "GLA requested but `fla` is not installed. Install FLA to use `GLA_0.4B` "
+                "(needed symbol: fla.ops.simple_gla.chunk_simple_gla)."
+            )
+
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+        q = rearrange(q, "b t (h d) -> b t h d", h=self.n_head)
+        k = rearrange(k, "b t (h d) -> b t h d", h=self.n_head)
+        v = rearrange(v, "b t (h d) -> b t h d", h=self.n_head)
+
+        if not self.config.nope and rope is not None:
+            cos, sin = rope
+            q = apply_rotary_emb_func(q, cos, sin, False, True)
+            k = apply_rotary_emb_func(k, cos, sin, False, True)
+
+        q = F.normalize(q, p=2, dim=-1).to(v)
+        k = F.normalize(k, p=2, dim=-1).to(v)
+        gk = F.logsigmoid(self.gk_proj(x).float()) / self.gate_logit_normalizer
+
+        o, _ = chunk_simple_gla(q, k, v, gk, head_first=False)
+        o = rearrange(o, "b t h d -> b t (h d)")
+        o = self.proj(o)
+        return o, None
+
+
 class Block(nn.Module):
     def __init__(self, config: Config, layer_idx: int) -> None:
         super().__init__()
         self.norm_1 = config.norm_class(config.n_embd, eps=config.norm_eps)
-        self.use_gated_deltanet = layer_idx % config.gated_delta_per_layer == 0 if config.gated_delta_per_layer >0 else False              
+        self.use_gated_deltanet = layer_idx % config.gated_delta_per_layer == 0 if config.gated_delta_per_layer > 0 else False
+        self.use_gla = layer_idx % config.gla_per_layer == 0 if config.gla_per_layer > 0 else False
+        if self.use_gated_deltanet and self.use_gla:
+            raise ValueError("`gated_delta_per_layer` and `gla_per_layer` cannot be active on the same layer.")
         if self.use_gated_deltanet:
-            self.attn = GatedDeltaNet(hidden_size=config.n_embd, qk_norm=config.qk_norm, num_heads=config.n_head)      
+            self.attn = GatedDeltaNet(hidden_size=config.n_embd, qk_norm=config.qk_norm, num_heads=config.n_head)
+        elif self.use_gla:
+            self.attn = SimpleGLA(config, n_embd=config.n_embd)
         else:
             self.attn = CausalSelfAttention(config, n_embd= config.n_embd, layer_idx= layer_idx, )
         if not config.shared_attention_norm and config.mlp and not config.parallel_residual:
@@ -308,6 +373,8 @@ class Block(nn.Module):
     
         if self.use_gated_deltanet:
             h, _ , new_kv_cache = self.attn(n_1, attention_mask=mask)
+        elif self.use_gla:
+            h, new_kv_cache = self.attn(n_1, rope, max_seq_length, mask, input_pos, kv_cache)
         else:
             h, new_kv_cache = self.attn(n_1, rope, max_seq_length, mask, input_pos, kv_cache)   
         if self.config.parallel_residual:

@@ -8,8 +8,8 @@ SAVE_DIR="/home/huiwei/jiaxuanzou/linear_attn/save_dir"
 
 # Experiment settings
 FULL_TRAIN_TOKENS=1000000000
-NAME="${NAME:-512x4k_1B_Kaczmarz_0.4B}"
-MODEL="${MODEL:-Kaczmarz_0.4B}"
+NAME="${NAME:-512x4k_1B_GLA_0.4B}"
+MODEL="${MODEL:-GLA_0.4B}"
 SEED="${SEED:-42}"
 CONFIG="${CONFIG:-tsz512x4k}"
 EVAL_ITERS="${EVAL_ITERS:-15}"
@@ -32,6 +32,17 @@ export WANDB_MODE=online
 export WANDB_PROJECT="linear-attn-new" # 可以在这里修改为你想要的 wandb project 名称
 export WANDB_DIR="${WANDB_DIR}"
 
+PYTHON_BIN="/home/huiwei/miniconda3/envs/jiaxuanzou/bin/python"
+
+# Fail fast if FLA is missing, since GLA_0.4B depends on fla.ops.simple_gla.
+if [[ "${MODEL}" == GLA* ]]; then
+  ${PYTHON_BIN} -c "from fla.ops.simple_gla import chunk_simple_gla" >/dev/null 2>&1 || {
+    echo "ERROR: MODEL=${MODEL} requires FLA, but 'from fla.ops.simple_gla import chunk_simple_gla' failed."
+    echo "Please install in jiaxuanzou env: conda run -n jiaxuanzou python -m pip install -U flash-linear-attention"
+    exit 1
+  }
+fi
+
 # Create directories
 mkdir -p ${LOGS_DIR}
 mkdir -p ${WANDB_DIR}
@@ -47,8 +58,6 @@ echo "Max Tokens: ${MAX_TOKENS}"
 echo "Total Evals: ${TOTAL_EVALS}"
 echo "W&B Mode: ${WANDB_MODE}"
 echo "W&B Dir: ${WANDB_DIR}"
-
-PYTHON_BIN="/home/huiwei/miniconda3/envs/jiaxuanzou/bin/python"
 
 ${PYTHON_BIN} -u ${OUTPUT_ROOT}/pretrain.py \
     --train_data_dir ${TRAIN_DATA} \
