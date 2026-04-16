@@ -17,12 +17,6 @@ from analysis_plot_style import (
 )
 
 
-def _parse_csv_keywords(value: str):
-    if not value:
-        return []
-    return [item.strip() for item in value.split(",") if item.strip()]
-
-
 def _format_k_step(value, _pos):
     if abs(value) < 1000:
         return str(int(value))
@@ -32,29 +26,19 @@ def _format_k_step(value, _pos):
     return f"{k:.1f}k"
 
 
-def load_results(out_root: str, include_experiment: str | None = None, exclude_keywords=None):
+def load_results(out_root: str):
     result_files = glob.glob(os.path.join(out_root, "**", "results.json"), recursive=True)
-    exclude_keywords = exclude_keywords or []
 
     seq_rows = []
     step_rows = []
-    used_files = []
 
     for path in result_files:
-        norm_path = path.replace("\\", "/")
-        if include_experiment and include_experiment not in norm_path:
-            continue
-        if any(keyword in norm_path for keyword in exclude_keywords):
-            continue
-
         try:
             with open(path, "r") as f:
                 data = json.load(f)
         except Exception as e:
             print(f"Skip invalid result file {path}: {e}")
             continue
-
-        used_files.append(path)
 
         model_raw = data.get("model_name", "Unknown")
         model = normalize_model_name(model_raw)
@@ -89,7 +73,7 @@ def load_results(out_root: str, include_experiment: str | None = None, exclude_k
                 }
             )
 
-    return pd.DataFrame(seq_rows), pd.DataFrame(step_rows), used_files
+    return pd.DataFrame(seq_rows), pd.DataFrame(step_rows), result_files
 
 
 def aggregate_for_plot(df: pd.DataFrame, group_cols):
@@ -128,7 +112,7 @@ def plot_seq_len(ax, df: pd.DataFrame):
         ax.set_axis_off()
         return
 
-    format_axis(ax, xlabel="Sequence length", ylabel="Accuracy (%)", ylim=(0, 102))
+    format_axis(ax, xlabel="Sequence length", ylabel="Accuracy (%)", ylim=(80, 102))
     seq_ticks = sorted(agg["Seq Len"].unique())
     ax.set_xscale("log", base=2)
     ax.set_xticks(seq_ticks)
@@ -179,30 +163,13 @@ def main():
     apply_publication_style()
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out_root", type=str, default="./out/palindrome")
-    parser.add_argument("--save_dir", type=str, default="./analysis_results/palindrome")
-    parser.add_argument(
-        "--include_experiment",
-        type=str,
-        default="Palindrome_seq1024_v128_h2_seed42_20000steps",
-        help="Only include result paths containing this experiment tag.",
-    )
-    parser.add_argument(
-        "--exclude_path_keywords",
-        type=str,
-        default="pf1,_backup_",
-        help="Comma-separated path keywords to exclude.",
-    )
+    parser.add_argument("--out_root", type=str, default="./out/stack")
+    parser.add_argument("--save_dir", type=str, default="./analysis_results/stack")
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
 
-    exclude_keywords = _parse_csv_keywords(args.exclude_path_keywords)
-    seq_df, step_df, files = load_results(
-        args.out_root,
-        include_experiment=args.include_experiment,
-        exclude_keywords=exclude_keywords,
-    )
+    seq_df, step_df, files = load_results(args.out_root)
     if not files:
         print("No results.json found.")
         return
@@ -221,7 +188,7 @@ def main():
     plot_seq_len(ax1, seq_df)
     plot_steps(ax2, step_df)
 
-    png_path, pdf_path = save_publication_figure(fig, args.save_dir, "palindrome_metrics")
+    png_path, pdf_path = save_publication_figure(fig, args.save_dir, "stack_metrics")
     plt.close(fig)
 
     print(f"Loaded {len(files)} result files")
