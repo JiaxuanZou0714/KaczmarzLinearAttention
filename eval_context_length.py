@@ -4,6 +4,8 @@ import os
 import argparse
 import math
 import time
+import csv
+import json
 from pathlib import Path
 from typing import List
 
@@ -36,16 +38,30 @@ def get_parser():
     parser.add_argument('--wandb_project', type=str, default='linear_attn_eval', help='Wandb project name')
     parser.add_argument('--wandb_name', type=str, default='', help='Wandb run name')
     parser.add_argument('--wandb_dir', type=str, default='./wandb', help='Wandb save directory')
+    parser.add_argument('--disable_wandb', action='store_true', help='Disable wandb logging for offline evaluation')
+
+    # Optional artifact outputs for downstream aggregation/plotting.
+    parser.add_argument('--model_alias', type=str, default='', help='Optional model alias used in output artifacts')
+    parser.add_argument('--save_json', type=str, default='', help='Path to save evaluation metrics JSON')
+    parser.add_argument('--save_csv', type=str, default='', help='Path to save evaluation metrics CSV')
     
     return parser
 
 @torch.no_grad()
-def validate(fabric: L.Fabric, model: torch.nn.Module, val_dataloader: DataLoader, lengths: List[int], eval_iters: int) -> None:
+def validate(
+    fabric: L.Fabric,
+    model: torch.nn.Module,
+    val_dataloader: DataLoader,
+    lengths: List[int],
+    eval_iters: int,
+    wandb_logger=None,
+):
     fabric.print("Validating ...")
     model.eval()
 
-    # Dictionary to store losses for each length
-    losses = {l: torch.zeros(eval_iters, device=fabric.device) for l in lengths}
+    # Track per-length sums/counts. Some long lengths may be skipped if a batch is too short.
+    loss_sums = {l: torch.zeros(1, device=fabric.device) for l in lengths}
+    loss_counts = {l: 0 for l in lengths}
     
     for k, val_data in enumerate(val_dataloader):
         if k >= eval_iters:
@@ -62,38 +78,148 @@ def validate(fabric: L.Fabric, model: torch.nn.Module, val_dataloader: DataLoade
             
             logits = model(input_ids)
             loss = chunked_cross_entropy(logits, targets, chunk_size=0)
-            losses[length][k] = loss.item()
+            loss_sums[length] += loss.detach()
+            loss_counts[length] += 1
     
     fabric.print("\n" + "="*50)
     fabric.print(f"{'Context Length':<15} | {'Loss':<10} | {'PPL':<10}")
     fabric.print("-" * 50)
+
+    result_rows = []
     
     for length in sorted(lengths):
-        avg_loss = losses[length].mean().item()
-        try:
-            ppl = math.exp(avg_loss)
-        except OverflowError:
-            ppl = float('inf')
-        fabric.print(f"{length:<15} | {avg_loss:.4f}     | {ppl:.4f}")
-        
-        # Log to Wandb
-        # 1. Log specific metrics for each length (good for tables/scalar comparison)
-        fabric.log_dict({
-            f"eval/loss_{length}": avg_loss,
-            f"eval/ppl_{length}": ppl
-        })
+        count = loss_counts[length]
+        if count == 0:
+            avg_loss = float('nan')
+            ppl = float('nan')
+            fabric.print(f"{length:<15} | {'nan':<10} | {'nan':<10} (no valid batches)")
+        else:
+            avg_loss = (loss_sums[length] / count).item()
+            try:
+                ppl = math.exp(avg_loss)
+            except OverflowError:
+                ppl = float('inf')
+            fabric.print(f"{length:<15} | {avg_loss:.4f}     | {ppl:.4f}")
 
-        # 2. Log shared metrics for curve plotting (PPL vs Context Length)
-        # This allows setting 'curve/context_length' as X-axis in Wandb UI
-        if isinstance(fabric.logger, WandbLogger):
-            fabric.logger.experiment.log({
-                "curve/context_length": length,
-                "curve/ppl": ppl,
-                "curve/loss": avg_loss
+            # Log specific metrics for each length (scalar comparison/table use).
+            fabric.log_dict({
+                f"eval/loss_{length}": avg_loss,
+                f"eval/ppl_{length}": ppl
             })
+
+            # Log shared metrics for curve plotting (PPL vs Context Length).
+            if wandb_logger is not None and fabric.global_rank == 0:
+                wandb_logger.experiment.log({
+                    "curve/context_length": length,
+                    "curve/ppl": ppl,
+                    "curve/loss": avg_loss
+                })
+
+        result_rows.append(
+            {
+                "context_length": int(length),
+                "loss": float(avg_loss),
+                "ppl": float(ppl),
+                "num_batches": int(count),
+            }
+        )
     
     fabric.print("="*50 + "\n")
     model.train()
+    return result_rows
+
+
+def _ensure_parent(path: str) -> None:
+    if not path:
+        return
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def _baseline_info(rows, preferred_baseline: int = 4096):
+    finite = [row for row in rows if math.isfinite(row["ppl"])]
+    if not finite:
+        return None, None
+
+    by_length = {row["context_length"]: row for row in finite}
+    if preferred_baseline in by_length:
+        base = by_length[preferred_baseline]
+        return preferred_baseline, base["ppl"]
+
+    shortest = min(finite, key=lambda x: x["context_length"])
+    return shortest["context_length"], shortest["ppl"]
+
+
+def _enrich_rows_with_baseline(rows, baseline_length: int | None, baseline_ppl: float | None):
+    enriched = []
+    for row in sorted(rows, key=lambda x: x["context_length"]):
+        new_row = dict(row)
+        if baseline_length is None or baseline_ppl is None:
+            new_row["baseline_length"] = None
+            new_row["baseline_ppl"] = None
+            new_row["ppl_ratio_vs_baseline"] = None
+            new_row["ppl_increase_pct_vs_baseline"] = None
+        elif math.isfinite(row["ppl"]):
+            ratio = row["ppl"] / baseline_ppl if baseline_ppl > 0 else float('nan')
+            new_row["baseline_length"] = int(baseline_length)
+            new_row["baseline_ppl"] = float(baseline_ppl)
+            new_row["ppl_ratio_vs_baseline"] = float(ratio)
+            new_row["ppl_increase_pct_vs_baseline"] = float((ratio - 1.0) * 100.0)
+        else:
+            new_row["baseline_length"] = int(baseline_length)
+            new_row["baseline_ppl"] = float(baseline_ppl)
+            new_row["ppl_ratio_vs_baseline"] = None
+            new_row["ppl_increase_pct_vs_baseline"] = None
+        enriched.append(new_row)
+    return enriched
+
+
+def maybe_save_results(args, rows) -> None:
+    if not args.save_json and not args.save_csv:
+        return
+
+    baseline_length, baseline_ppl = _baseline_info(rows)
+    enriched = _enrich_rows_with_baseline(rows, baseline_length, baseline_ppl)
+
+    payload = {
+        "model_name": args.model_alias or args.config_name,
+        "config_name": args.config_name,
+        "ckpt_path": args.ckpt_path,
+        "data_dir": args.data_dir,
+        "lengths": [int(l) for l in sorted(set(int(v["context_length"]) for v in rows))],
+        "eval_iters": int(args.eval_iters),
+        "batch_size": int(args.batch_size),
+        "seed": int(args.seed),
+        "baseline_length": baseline_length,
+        "baseline_ppl": baseline_ppl,
+        "results": enriched,
+    }
+
+    if args.save_json:
+        _ensure_parent(args.save_json)
+        with open(args.save_json, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        print(f"Saved JSON: {args.save_json}")
+
+    if args.save_csv:
+        _ensure_parent(args.save_csv)
+        fieldnames = [
+            "context_length",
+            "loss",
+            "ppl",
+            "num_batches",
+            "baseline_length",
+            "baseline_ppl",
+            "ppl_ratio_vs_baseline",
+            "ppl_increase_pct_vs_baseline",
+        ]
+        with open(args.save_csv, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in enriched:
+                writer.writerow({k: row.get(k) for k in fieldnames})
+        print(f"Saved CSV: {args.save_csv}")
 
 def create_val_dataloader(
     batch_size: int,
@@ -134,30 +260,36 @@ def main():
     lengths = [int(l) for l in args.lengths.split(',')]
     max_len = max(lengths)
     
-    # Initialize Wandb Logger
-    wandb_logger = WandbLogger(
-        project=args.wandb_project,
-        name=args.wandb_name or f"eval_{args.config_name}_{int(time.time())}",
-        save_dir=args.wandb_dir,
-        version=args.wandb_name
-    )
+    # Initialize optional Wandb logger.
+    wandb_logger = None
+    if not args.disable_wandb:
+        wandb_logger = WandbLogger(
+            project=args.wandb_project,
+            name=args.wandb_name or f"eval_{args.config_name}_{int(time.time())}",
+            save_dir=args.wandb_dir,
+            version=args.wandb_name
+        )
 
     # Initialize Fabric
     # Use bfloat16-mixed if cuda is available, else 32-true
     precision = "bf16-mixed" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "32-true"
     strategy = "auto"
     
-    fabric = L.Fabric(
-        accelerator=args.device, 
-        strategy=strategy, 
-        precision=precision,
-        loggers=[wandb_logger]
-    )
+    fabric_kwargs = {
+        "accelerator": args.device,
+        "strategy": strategy,
+        "precision": precision,
+    }
+    if wandb_logger is not None:
+        fabric_kwargs["loggers"] = [wandb_logger]
+
+    fabric = L.Fabric(**fabric_kwargs)
     fabric.launch()
     fabric.seed_everything(args.seed)
     
-    # Log hyperparameters
-    fabric.logger.log_hyperparams(args)
+    # Log hyperparameters only when wandb is enabled.
+    if wandb_logger is not None and fabric.global_rank == 0:
+        wandb_logger.log_hyperparams(args)
 
     if fabric.global_rank == 0:
         fabric.print(f"Loading config: {args.config_name}")
@@ -195,7 +327,16 @@ def main():
     val_dataloader = fabric.setup_dataloaders(val_dataloader)
     
     # Run validation
-    validate(fabric, model, val_dataloader, lengths, args.eval_iters)
+    rows = validate(
+        fabric,
+        model,
+        val_dataloader,
+        lengths,
+        args.eval_iters,
+        wandb_logger=wandb_logger,
+    )
+    if fabric.global_rank == 0:
+        maybe_save_results(args, rows)
 
 if __name__ == "__main__":
     main()
