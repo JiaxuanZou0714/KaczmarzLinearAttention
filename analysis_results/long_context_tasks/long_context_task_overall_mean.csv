@@ -1,0 +1,4 @@
+Model,Benchmark,Exact Match,Contains Match,F1,Num Evaluated,Num Skipped,Num Total,Elapsed Sec,Num Runs
+GDN,RULER,0.0,0.0,0.0,2.0,0.0,2.0,4.320967674255371,1
+KLA,RULER,0.0,0.0,0.0,2.0,0.0,2.0,4.1742095947265625,1
+Mamba2,RULER,0.0,0.0,0.0,2.0,0.0,2.0,30.984597206115723,1

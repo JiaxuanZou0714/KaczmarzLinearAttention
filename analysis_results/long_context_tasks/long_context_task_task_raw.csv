@@ -1,0 +1,7 @@
+Model,Benchmark,Task,Exact Match,Contains Match,F1,Num Samples,Path
+GDN,RULER,RULER-SNIAH,0.0,0.0,0.0,1,/home/huiwei/jiaxuanzou/linear_attn/GatedDeltaNet/out/long_context_tasks/RULER/GDN/results.json
+GDN,RULER,RepoQA,0.0,0.0,0.0,1,/home/huiwei/jiaxuanzou/linear_attn/GatedDeltaNet/out/long_context_tasks/RULER/GDN/results.json
+KLA,RULER,RULER-SNIAH,0.0,0.0,0.0,1,/home/huiwei/jiaxuanzou/linear_attn/GatedDeltaNet/out/long_context_tasks/RULER/KLA/results.json
+KLA,RULER,RepoQA,0.0,0.0,0.0,1,/home/huiwei/jiaxuanzou/linear_attn/GatedDeltaNet/out/long_context_tasks/RULER/KLA/results.json
+Mamba2,RULER,RULER-SNIAH,0.0,0.0,0.0,1,/home/huiwei/jiaxuanzou/linear_attn/GatedDeltaNet/out/long_context_tasks/RULER/Mamba2/results.json
+Mamba2,RULER,RepoQA,0.0,0.0,0.0,1,/home/huiwei/jiaxuanzou/linear_attn/GatedDeltaNet/out/long_context_tasks/RULER/Mamba2/results.json

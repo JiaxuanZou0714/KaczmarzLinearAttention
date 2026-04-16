@@ -1,0 +1,4 @@
+Model,Benchmark,Context Bucket,Exact Match,Contains Match,F1,Num Samples,Num Runs
+GDN,RULER,1-4096,0.0,0.0,0.0,2.0,1
+KLA,RULER,1-4096,0.0,0.0,0.0,2.0,1
+Mamba2,RULER,1-4096,0.0,0.0,0.0,2.0,1
