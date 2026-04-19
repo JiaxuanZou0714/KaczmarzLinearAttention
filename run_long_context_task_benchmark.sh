@@ -85,6 +85,18 @@ PROMPT_TRUNCATION="${PROMPT_TRUNCATION:-none}"
 STOP_STRINGS="${STOP_STRINGS:-}"
 ALLOW_OOM_SKIP="${ALLOW_OOM_SKIP:-1}"
 SAVE_PREDICTIONS="${SAVE_PREDICTIONS:-0}"
+LONGBENCH_SAFE_MAX_PROMPT_TOKENS="${LONGBENCH_SAFE_MAX_PROMPT_TOKENS:-32768}"
+ALLOW_UNBOUNDED_LONGBENCH_PROMPT="${ALLOW_UNBOUNDED_LONGBENCH_PROMPT:-0}"
+
+if [[ "${DATASET_PRESET}" == "longbench_v2" && "${MAX_PROMPT_TOKENS}" == "0" && "${ALLOW_UNBOUNDED_LONGBENCH_PROMPT}" != "1" ]]; then
+  MAX_PROMPT_TOKENS="${LONGBENCH_SAFE_MAX_PROMPT_TOKENS}"
+  if [[ "${PROMPT_TRUNCATION}" == "none" ]]; then
+    PROMPT_TRUNCATION="left"
+  fi
+  echo "WARNING: LongBench-v2 long prompts can exceed CUDA kernel stability limits."
+  echo "         Auto-set MAX_PROMPT_TOKENS=${MAX_PROMPT_TOKENS}, PROMPT_TRUNCATION=${PROMPT_TRUNCATION}."
+  echo "         Set ALLOW_UNBOUNDED_LONGBENCH_PROMPT=1 to keep full prompts (may crash)."
+fi
 
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 if [[ -d "/home/huiwei/miniconda3/envs/jiaxuanzou/lib" ]]; then

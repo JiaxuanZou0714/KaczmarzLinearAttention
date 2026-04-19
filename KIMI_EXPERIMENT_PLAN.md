@@ -1,166 +1,152 @@
-# 实验计划（六类，按重要性优先级）
+# 实验计划（轻算力优先，聚焦线性注意力能力）
 
 ## 目标
-基于当前已完成的四类实验（Pretrain、MQAR、Palindrome、Stack），补齐与 Kimi Linear 技术报告最相关的六类实验验证，优先完成对结论影响最大的项目。
+- 暂停 LongBench 全量评测与新增大规模 pretrain。
+- 对齐 Kimi Linear 与 Gated DeltaNet 论文的核心实验维度。
+- 基于现有 0.4B checkpoints，优先产出可复现、可比较、可快速完成的结果。
 
-## 优先级总览
-| 优先级 | 实验类别 | 目标 | 主要产出 |
+## 论文对齐（实验维度）
+参考：
+- Kimi Linear 技术报告（arXiv:2510.26692）实验章节包含：Synthetic tests、关键组件消融、Scaling law、主结果（短上下文/长上下文/RL）、效率对比（Prefill/Decode/KV cache）。
+- Gated DeltaNet（arXiv:2412.06464）实验章节包含：语言建模与常识推理、Recall-intensive（含 S-NIAH/RULER）、长度外推、LongBench、吞吐效率、组件与混合结构消融。
+
+| 论文维度 | 论文代表任务 | 当前轻算力替代 | 立即可跑 |
 |---|---|---|---|
-| P0 | 长上下文外推曲线 | 验证长度扩展时的困惑度退化斜率 | 长度-PPL 曲线图、对比表 |
-| P0 | NoPE vs RoPE 消融 | 验证位置编码策略对长上下文表现影响 | 配置对照、长短上下文结果表 |
-| P1 | 混合比例消融（线性层:全注意力层） | 找到效果与效率折中最优比例 | 比例-效果曲线、推荐比例 |
-| P1 | 关键组件消融（输出门控、卷积层） | 定位性能增益主要来源 | 组件开关消融表 |
-| P2 | 效率实验（Prefill/Decode/KV Cache） | 量化工程侧收益 | 吞吐与时延曲线、显存表 |
-| P2 | 长上下文任务基准（RULER 等） | 验证真实任务泛化能力 | 各基准分数汇总表 |
+| 长度外推 | PG19/CodeParrot 长度-PPL | `run_long_context_extrapolation.sh` | 是 |
+| Recall/记忆能力 | S-NIAH (RULER), Recall-intensive | 标准 S-NIAH（RULER-NIAH 全量）+ MQAR | 是 |
+| 合成机制能力 | Synthetic tests, state tracking | Palindrome + Stack + MQAR | 是 |
+| 效率 | Prefill/Decode/KV cache/Throughput | `run_efficiency_experiment.sh` | 是 |
+| 长上下文真实任务 | LongBench/MRCR/RepoQA/Frames | MRCR/RULER 小规模，LongBench 暂停 | 部分 |
+| 大规模能力验证 | Scaling law, RL, 大模型主榜单 | 需新增训练，暂缓 | 否 |
 
 ---
 
-## P0-1 长上下文外推曲线
-### 实验目标
-- 对比不同模型在长度从短到长扩展时的 PPL 变化趋势。
-- 评估在超出训练窗口后，退化速度是否可控。
+## P0（今天可出结果）
 
-### 关键指标
-- 各长度点的验证集 Loss、PPL。
-- 相对 4k 基线的 PPL 增幅。
-- 曲线斜率（长度增加时的退化速率）。
+### P0-1 长度外推曲线（主结论）
+目标：验证不同线性注意力模型在长度扩展时的退化斜率。
 
-### 实施步骤
-1. 固定同一数据切分与 checkpoint 集合。
-2. 统一评测长度列表（建议 1k, 2k, 4k, 8k, 16k, 32k, 64k）。
-3. 生成单模型曲线与多模型同图对比。
+建议命令：
 
-### 交付物
-- 长度-PPL 曲线图（PNG/PDF）。
-- 长度-PPL 明细 CSV。
-- 一页结论总结（谁退化最慢，拐点在哪里）。
+```bash
+cd /home/huiwei/jiaxuanzou/linear_attn/GatedDeltaNet
+MODELS=KLA,GDN,Mamba2,GLA,DeltaNet,Longhorn \
+LENGTHS=1024,2048,4096,8192,16384,32768,65536 \
+EVAL_ITERS=15 PROFILE=kimi_standard ./run_long_context_extrapolation.sh
+```
 
----
+交付物：长度-PPL 曲线、相对 4K 增幅表、退化斜率排序。
 
-## P0-2 NoPE vs RoPE 消融
-### 实验目标
-- 验证是否存在“短上下文与长上下文偏好不同”的位置编码现象。
-- 为后续主配置选择提供依据。
+### P0-2 效率对比（工程结论）
+目标：对齐论文中的 prefill/decode/KV cache 维度。
 
-### 关键指标
-- 短上下文指标（如 4k 范围内 PPL/任务分数）。
-- 长上下文指标（16k+ 区间 PPL 与基准任务）。
-- 相对提升幅度与稳定性。
+建议命令：
 
-### 实施步骤
-1. 构建成对配置（NoPE 与 RoPE），其余超参数保持一致。
-2. 在同训练预算下完成对照训练或在可行条件下做继续训练对照。
-3. 同时汇报短上下文与长上下文结果，避免单侧结论。
+```bash
+cd /home/huiwei/jiaxuanzou/linear_attn/GatedDeltaNet
+MODELS=KLA,GDN,Mamba2,GLA,DeltaNet,Longhorn \
+PROFILE=kimi_short ./run_efficiency_experiment.sh
+```
 
-### 交付物
-- NoPE/RoPE 对照表。
-- 两条长度外推曲线对比图。
-- 推荐默认位置编码方案。
+交付物：Prefill 延迟曲线、Decode tokens/s 曲线、显存/KV cache 对比表。
 
----
+### P0-3 Recall 能力（标准 S-NIAH）
+目标：补齐标准 S-NIAH（RULER-NIAH 全量）评测，仅比较 KLA、GDN、Mamba2。
 
-## P1-1 混合比例消融（线性层:全注意力层）
-### 实验目标
-- 找到效果与效率的最佳折中点，复现实验报告中的“比例敏感性”。
+建议命令：
 
-### 关键指标
-- 训练 PPL、验证 PPL。
-- 推理速度与显存占用。
-- 长上下文性能变化。
+```bash
+cd /home/huiwei/jiaxuanzou/linear_attn/GatedDeltaNet
+DATASET_PRESET=ruler_selflong \
+DATASET_OUTPUT=./data/long_context_tasks/real/ruler_sniah_standard.jsonl \
+BENCHMARK_NAME=RULER_SNIAH_STANDARD \
+RULER_CONFIGS=niah_single_1_4k,niah_multikey_1_4k,niah_multiquery_4k,niah_multivalue_4k \
+PREP_MAX_SAMPLES=0 MODELS=KLA,GDN,Mamba2 \
+PROFILE=kimi_standard ./run_long_context_task_benchmark.sh
+```
 
-### 实施步骤
-1. 设定比例候选（建议 0:1、1:1、3:1、7:1）。
-2. 保持训练 token 预算一致。
-3. 汇总效果-效率 Pareto 前沿。
+或直接：
 
-### 交付物
-- 比例消融结果表。
-- 效果-效率散点图。
-- 推荐比例与适用场景说明。
+```bash
+cd /home/huiwei/jiaxuanzou/linear_attn/GatedDeltaNet
+./run_sniah_experiment.sh
+```
+
+交付物：EM/Contains/F1 汇总表、按 task 与长度桶的对比图。
 
 ---
 
-## P1-2 关键组件消融（输出门控、卷积层）
-### 实验目标
-- 明确输出门控与短卷积对性能的真实贡献。
+## P1（1-2 天，可承受训练）
 
-### 关键指标
-- 训练/验证 PPL。
-- 收敛速度（到达目标 PPL 的步数）。
-- 训练稳定性（方差、异常波动）。
+### P1-1 合成任务三件套（机制能力验证）
+目标：聚焦“线性注意力本身的记忆与状态更新能力”，避开大规模语料 pretrain。
 
-### 实施步骤
-1. 组件开关矩阵：
-   - 默认配置
-   - 去掉输出门控
-   - 门控函数替换
-   - 去掉卷积层
-2. 每个设置至少多 seed 复现，避免偶然性。
+建议顺序：
+1. `run_mqar_experiment.sh`
+2. `run_palindrome_experiment.sh`
+3. `run_stack_experiment.sh`
 
-### 交付物
-- 组件消融表（均值与方差）。
-- 收敛曲线对比图。
-- 推荐默认组件组合。
+交付物：准确率-长度曲线、收敛步数对比、模型排序稳定性。
 
----
+### P1-2 小规模 MRCR（可选）
+目标：补一个真实检索任务，不做 LongBench。
 
-## P2-1 效率实验（Prefill/Decode/KV Cache）
-### 实验目标
-- 量化架构收益在工程侧的实际价值。
+建议命令：
 
-### 关键指标
-- Prefill 延迟（不同上下文长度）。
-- Decode 吞吐（不同上下文长度与 batch）。
-- 峰值显存与 KV cache 占用。
+```bash
+cd /home/huiwei/jiaxuanzou/linear_attn/GatedDeltaNet
+DATASET_PRESET=mrcr_openai BENCHMARK_NAME=MRCR_REAL \
+MRCR_NEEDLES=2 PREP_MAX_SAMPLES=300 MODELS=KLA,GDN,Mamba2 \
+PROFILE=kimi_quick ./run_long_context_task_benchmark.sh
+```
 
-### 实施步骤
-1. 固定硬件、精度、batch、框架版本。
-2. 统一测试脚本与 warmup 策略。
-3. 分别统计 prefill 与 decode 阶段。
+### P1-3 合成 S-NIAH（兜底）
+目标：若真实 RULER S-NIAH 对 pretrain-only checkpoint 过难，先用合成 single-needle 训练验证模型可学习性。
 
-### 交付物
-- 吞吐/时延曲线图。
-- KV cache 占用对比表。
-- 工程部署建议（哪个模型在什么上下文最划算）。
+建议命令：
+
+```bash
+cd /home/huiwei/jiaxuanzou/linear_attn/GatedDeltaNet
+PROFILE=quick ./run_synthetic_sniah_experiment.sh
+```
+
+说明：
+1. 该脚本将 `MQAR(num_pairs=1)` 作为 synthetic S-NIAH proxy。
+2. 默认只跑 KLA/GDN/Mamba2 对应的小模型配置（`RelaxedKaczmarzQNorm_MQAR,GatedDeltaNet_MQAR,Mamba2_MQAR`）。
+3. quick 冒烟后可切到 `PROFILE=standard` 跑完整对照。
 
 ---
 
-## P2-2 长上下文任务基准（RULER 等）
-### 实验目标
-- 在真实任务上验证“长上下文优势”而非仅靠 PPL 曲线。
+## P2（算力充足后恢复）
 
-### 建议基准
-- RULER
-- MRCR
-- RepoQA
-- LongBench v2（按资源可选）
-
-### 关键指标
-- 各任务主指标分数。
-- 平均分与相对提升。
-- 长输入长度分桶表现。
-
-### 实施步骤
-1. 优先接入 RULER 与一项代码/检索型长上下文任务。
-2. 跑通评测后扩展到完整基准集合。
-3. 使用统一 prompt 与评测配置做公平对比。
-
-### 交付物
-- 长上下文任务分数汇总表。
-- 分任务雷达图或柱状图。
-- 与现有四类实验的统一结论页。
+以下项目暂缓，不纳入近期里程碑：
+1. LongBench-v2 全量评测。
+2. NoPE vs RoPE 成对对照（需新增训练）。
+3. 混合比例消融（0:1/1:1/3:1/7:1，需新增训练）。
+4. 组件消融（去门控/改门控/去卷积，需新增训练）。
+5. Kimi Linear 风格的 scaling law 与 RL 阶段对照。
 
 ---
 
-## 推荐执行顺序（里程碑）
-1. 里程碑 A（最快形成结论）：P0 两项（长度外推 + NoPE/RoPE）。
-2. 里程碑 B（定位机制来源）：P1 两项（比例 + 组件）。
-3. 里程碑 C（工程与任务闭环）：P2 两项（效率 + 长任务基准）。
+## 统一统计口径（避免误判）
 
-## 风险与规避
-- 风险：长上下文评测成本高、运行时间长。
-  规避：先做小规模抽样长度，再扩展全长度。
-- 风险：消融项过多导致实验矩阵膨胀。
-  规避：优先做单变量消融，再做组合实验。
-- 风险：不同脚本口径不一致导致不可比。
-  规避：统一数据切分、随机种子、日志字段与统计口径。
+### 任务指标
+1. 主指标：EM、Contains、F1。
+2. 对多选任务额外记录“首个 A/B/C/D 命中率”（用于识别格式跟随失败）。
+3. 长度桶统一：4K/8K/16K/32K/64K/128K。
+
+### 公平比较
+1. 所有模型使用同一输入切分、同一解码参数、同一 tokenizer。
+2. 明确记录 truncation 设置（尤其是长上下文任务）。
+3. 报告 skipped 样本占比与原因（OOM/超长截断/空输出）。
+
+---
+
+## 最近里程碑（建议）
+
+1. 里程碑 A（当日完成）：P0-1 + P0-2。
+2. 里程碑 B（次日完成）：P0-3 + P1-1（至少 MQAR）。
+3. 里程碑 C（两天内）：补齐 Palindrome/Stack，并形成统一结论页。
+
+## 一句话结论模板
+在不新增大规模 pretrain 的前提下，优先用“长度外推 + 效率 + 标准 S-NIAH + 合成机制任务”建立线性注意力能力证据链，LongBench 与大规模消融后置。

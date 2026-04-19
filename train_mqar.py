@@ -290,7 +290,9 @@ def train(fabric, state, train_dataloader, val_dataloader, loss_func, args):
                 print(f"Step {step}: Val Acc {val_acc:.4f}")
 
             # Early stopping check
-            if val_acc > state["best_val_acc"]:
+            # Always keep the first validation checkpoint as best baseline.
+            # This avoids missing best_model/results when val_acc stays at 0.0.
+            if best_model_path is None or val_acc > state["best_val_acc"]:
                 state["best_val_acc"] = val_acc
                 state["no_improve_count"] = 0
 

@@ -93,6 +93,8 @@ Run-script variables:
 - `PROMPT_TRUNCATION`: `none|left|right` when `MAX_PROMPT_TOKENS > 0`
 - `STOP_STRINGS`: comma-separated stop strings
 - `ALLOW_OOM_SKIP`: `1` to skip OOM samples
+- `LONGBENCH_SAFE_MAX_PROMPT_TOKENS`: auto cap for `DATASET_PRESET=longbench_v2` when `MAX_PROMPT_TOKENS=0` (default `32768`)
+- `ALLOW_UNBOUNDED_LONGBENCH_PROMPT`: set `1` to disable the auto cap (may trigger CUDA illegal memory access on very long prompts)
 - `SAVE_PREDICTIONS`: `1` to store generated text in JSON/CSV
 - `TOKENIZER_NAME`: Hugging Face tokenizer name (default TinyLlama)
 - `TOKENIZER_DIR`: optional local tokenizer directory
@@ -123,3 +125,6 @@ For fair model comparison:
 
 - This P2-2 pipeline is intentionally evaluation-only and does not require re-pretraining.
 - For strict paper comparison with external implementations, keep prompt templates exactly fixed across models.
+- LongBench-v2 (`long`) samples can be extremely long. If prompts are unbounded, custom Triton kernels may crash with CUDA illegal memory access.
+  - Default run script behavior now auto-applies a safe cap for LongBench-v2.
+  - To force full prompts: `ALLOW_UNBOUNDED_LONGBENCH_PROMPT=1`.

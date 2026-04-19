@@ -39,11 +39,18 @@ class ApplyRotaryEmb(torch.autograd.Function):
                 if not interleaved
                 else (out_ro[..., ::2], out_ro[..., 1::2])
             )
+        cos_local = cos[:seqlen]
+        sin_local = sin[:seqlen]
+        if cos_local.dtype != x.dtype or cos_local.device != x.device:
+            cos_local = cos_local.to(dtype=x.dtype, device=x.device)
+        if sin_local.dtype != x.dtype or sin_local.device != x.device:
+            sin_local = sin_local.to(dtype=x.dtype, device=x.device)
+
         rotary_emb.apply_rotary(
             x1,
             x2,
-            rearrange(cos[:seqlen], "s d -> s 1 d"),
-            rearrange(sin[:seqlen], "s d -> s 1 d"),
+            rearrange(cos_local, "s d -> s 1 d"),
+            rearrange(sin_local, "s d -> s 1 d"),
             o1,
             o2,
             False,
@@ -76,11 +83,18 @@ class ApplyRotaryEmb(torch.autograd.Function):
                 if not ctx.interleaved
                 else (dx_ro[..., ::2], dx_ro[..., 1::2])
             )
+        cos_local = cos[:seqlen]
+        sin_local = sin[:seqlen]
+        if cos_local.dtype != do.dtype or cos_local.device != do.device:
+            cos_local = cos_local.to(dtype=do.dtype, device=do.device)
+        if sin_local.dtype != do.dtype or sin_local.device != do.device:
+            sin_local = sin_local.to(dtype=do.dtype, device=do.device)
+
         rotary_emb.apply_rotary(
             do1,
             do2,
-            rearrange(cos[:seqlen], "s d -> s 1 d"),
-            rearrange(sin[:seqlen], "s d -> s 1 d"),
+            rearrange(cos_local, "s d -> s 1 d"),
+            rearrange(sin_local, "s d -> s 1 d"),
             dx1,
             dx2,
             True,
