@@ -26,6 +26,15 @@ from lit_gpt import FusedCrossEntropyLoss
 from mqar_data import MQARDataset, generate_mqar_data
 
 
+def str2bool(value: str) -> bool:
+    lowered = value.lower()
+    if lowered in {"1", "true", "yes", "y", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
 def parse_extrapolation_factors(factors: str) -> list[int]:
     parsed = []
     for token in factors.split(","):
@@ -150,6 +159,13 @@ def main(args):
     if args.n_embd: config.n_embd = args.n_embd
     if args.n_head: config.n_head = args.n_head
     if args.n_layer: config.n_layer = args.n_layer
+    if args.qk_norm is not None: config.qk_norm = args.qk_norm
+    if args.seq_factor_mode is not None: config.seq_factor_mode = args.seq_factor_mode
+    if args.gate_mode is not None: config.gate_mode = args.gate_mode
+    if args.expand_k is not None: config.expand_k = args.expand_k
+    if args.expand_v is not None: config.expand_v = args.expand_v
+    if args.learned_norm_init is not None: config.learned_norm_init = args.learned_norm_init
+    if args.use_mamba_gate is not None: config.use_mamba_gate = args.use_mamba_gate
 
     # Ensure head_size consistency
     if config.n_embd % config.n_head != 0:
@@ -238,6 +254,7 @@ def train(fabric, state, train_dataloader, val_dataloader, loss_func, args):
 
     best_checkpoints = [] # Keep track of (acc, path)
     best_model_path = None
+    consecutive_nonfinite = 0
 
     while step < max_steps:
         try:
@@ -257,10 +274,46 @@ def train(fabric, state, train_dataloader, val_dataloader, loss_func, args):
 
         loss = loss_func(logits_flat, labels_flat)
 
-        fabric.backward(loss)
-        fabric.clip_gradients(model, optimizer, max_norm=1.0)
-        optimizer.step()
-        optimizer.zero_grad()
+        update_succeeded = True
+        if not torch.isfinite(loss):
+            update_succeeded = False
+            if fabric.global_rank == 0:
+                print(f"Step {step + 1}: non-finite loss detected ({loss.item()}); skipping optimizer step.")
+        else:
+            fabric.backward(loss)
+            try:
+                fabric.clip_gradients(model, optimizer, max_norm=1.0)
+            except RuntimeError as exc:
+                if "non-finite" in str(exc).lower():
+                    update_succeeded = False
+                    if fabric.global_rank == 0:
+                        print(f"Step {step + 1}: non-finite gradient norm detected; skipping optimizer step.")
+                else:
+                    raise
+
+        if update_succeeded:
+            optimizer.step()
+            optimizer.zero_grad()
+            consecutive_nonfinite = 0
+        else:
+            optimizer.zero_grad()
+            consecutive_nonfinite += 1
+            for group in optimizer.param_groups:
+                group["lr"] = max(group["lr"] * args.nonfinite_lr_decay, args.min_learning_rate)
+            fabric.log_dict(
+                {
+                    "train/nonfinite_events": float(consecutive_nonfinite),
+                    "train/lr": optimizer.param_groups[0]["lr"],
+                },
+                step=step + 1,
+            )
+            if consecutive_nonfinite >= args.max_consecutive_nonfinite:
+                if fabric.global_rank == 0:
+                    print(
+                        "Too many consecutive non-finite updates "
+                        f"({consecutive_nonfinite}); stopping early."
+                    )
+                break
 
         # Compute accuracy on this batch (only on masked tokens)
         with torch.no_grad():
@@ -370,6 +423,9 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--devices", type=int, default=1)
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--max_consecutive_nonfinite", type=int, default=20)
+    parser.add_argument("--nonfinite_lr_decay", type=float, default=0.5)
+    parser.add_argument("--min_learning_rate", type=float, default=1e-6)
 
     parser.add_argument("--extrapolation_factors", type=str, default="1,2,4,8")
     parser.add_argument("--extrapol_num_val", type=int, default=2000)
@@ -377,6 +433,14 @@ if __name__ == "__main__":
     parser.add_argument("--extrapol_key_len", type=int, default=None)
     parser.add_argument("--extrapol_cache_dir", type=str, default=None)
     parser.add_argument("--num_pairs", type=int, default=32)
+
+    parser.add_argument("--qk_norm", type=str, default=None)
+    parser.add_argument("--seq_factor_mode", type=str, default=None)
+    parser.add_argument("--gate_mode", type=str, default=None)
+    parser.add_argument("--expand_k", type=float, default=None)
+    parser.add_argument("--expand_v", type=float, default=None)
+    parser.add_argument("--learned_norm_init", type=float, default=None)
+    parser.add_argument("--use_mamba_gate", type=str2bool, default=None)
 
     # Model overrides
     parser.add_argument("--n_embd", type=int, default=None)

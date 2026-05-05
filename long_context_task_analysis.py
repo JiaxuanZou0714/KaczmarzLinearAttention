@@ -11,6 +11,7 @@ import pandas as pd
 from analysis_plot_style import (
     MODEL_ORDER,
     apply_publication_style,
+    get_tables_dir,
     get_model_style,
     normalize_model_name,
     save_publication_figure,
@@ -237,7 +238,7 @@ def _plot_bucket_curve(ax, df: pd.DataFrame, metric: str, plot_order: List[str])
     ax.grid(True, which="minor", linewidth=0.4, alpha=0.2, linestyle=":")
     handles, labels = ax.get_legend_handles_labels()
     if handles:
-        ax.legend(loc="best", frameon=False, handlelength=2.8)
+        ax.legend(loc="lower right", frameon=False, handlelength=2.8)
 
 
 def main() -> None:
@@ -256,6 +257,7 @@ def main() -> None:
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
+    tables_dir = get_tables_dir(args.save_dir)
 
     overall_df, task_df, bucket_df, files = load_results(args.out_root)
     if not files:
@@ -296,13 +298,13 @@ def main() -> None:
         value_cols=["Exact Match", "Contains Match", "F1", "Num Samples"],
     )
 
-    overall_raw_csv = os.path.join(args.save_dir, "long_context_task_overall_raw.csv")
-    task_raw_csv = os.path.join(args.save_dir, "long_context_task_task_raw.csv")
-    bucket_raw_csv = os.path.join(args.save_dir, "long_context_task_bucket_raw.csv")
+    overall_raw_csv = os.path.join(tables_dir, "long_context_task_overall_raw.csv")
+    task_raw_csv = os.path.join(tables_dir, "long_context_task_task_raw.csv")
+    bucket_raw_csv = os.path.join(tables_dir, "long_context_task_bucket_raw.csv")
 
-    overall_mean_csv = os.path.join(args.save_dir, "long_context_task_overall_mean.csv")
-    task_mean_csv = os.path.join(args.save_dir, "long_context_task_task_mean.csv")
-    bucket_mean_csv = os.path.join(args.save_dir, "long_context_task_bucket_mean.csv")
+    overall_mean_csv = os.path.join(tables_dir, "long_context_task_overall_mean.csv")
+    task_mean_csv = os.path.join(tables_dir, "long_context_task_task_mean.csv")
+    bucket_mean_csv = os.path.join(tables_dir, "long_context_task_bucket_mean.csv")
 
     overall_df.to_csv(overall_raw_csv, index=False)
     task_df.to_csv(task_raw_csv, index=False)

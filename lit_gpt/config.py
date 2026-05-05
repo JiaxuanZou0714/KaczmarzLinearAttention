@@ -52,6 +52,11 @@ class Config:
     condense_ratio: int = 1
     qk_norm: str = 'l2'
     use_mamba_gate: bool = True
+    seq_factor_mode: str = 'none'
+    gate_mode: str = 'dual'
+    expand_k: float = 0.75
+    expand_v: float = 1.5
+    learned_norm_init: float = 1.0
 
     def __post_init__(self):
         # error checking
@@ -386,6 +391,26 @@ GatedDeltaNet = [
         intermediate_size=1024,
         local_window = 2048,
         mamba_init = True,
+    ),
+    dict(
+        org="NVIDIA",
+        name="GLA_MQAR",
+        block_size=1024,
+        vocab_size=8192,
+        padding_multiple=64,
+        gla_per_layer=1,
+        n_layer=2,
+        n_head=4,
+        n_embd=256,
+        rotary_percentage=1.0,
+        parallel_residual=False,
+        bias=False,
+        _norm_class="FusedRMSNorm",
+        norm_eps=1e-5,
+        _mlp_class="LLaMAMLP",
+        intermediate_size=1024,
+        local_window=2048,
+        mamba_init=True,
     ),
     dict(
         org="NVIDIA",

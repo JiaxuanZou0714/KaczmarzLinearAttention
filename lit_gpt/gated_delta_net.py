@@ -111,10 +111,27 @@ class GatedDeltaNet(nn.Module):
         use_mva: bool = False,
         use_residual: bool = False, # residual as in Mamba2,
         use_input_gate: bool = False,
+        seq_factor_mode: str = 'none',
+        gate_mode: str = 'dual',
+        learned_norm_init: float = 1.0,
     ) -> GatedDeltaNet:
         super().__init__()
         self.qk_norm = qk_norm
-        assert self.qk_norm in ['l2', 'longhorn', 'softmax', 'kaczmarz', 'relaxed_kaczmarz', 'relaxed_kaczmarz_q_norm']
+        assert self.qk_norm in [
+            'l2',
+            'longhorn',
+            'softmax',
+            'kaczmarz',
+            'relaxed_kaczmarz',
+            'relaxed_kaczmarz_q_norm',
+            'no_norm',
+            'k_norm_only',
+            'seq_only',
+            'learned_scalar',
+        ]
+        assert gate_mode in ['dual', 'single']
+        self.gate_mode = gate_mode
+        self.seq_factor_mode = self._normalize_seq_factor_mode(seq_factor_mode)
 
         self.use_mva = use_mva
 
@@ -181,11 +198,48 @@ class GatedDeltaNet(nn.Module):
             self.dt_bias = nn.Parameter(inv_dt)
             self.dt_bias._no_weight_decay = True
 
-        self.use_residual = use_residual            
+        self.use_residual = use_residual
         if self.use_residual:
             self.D = nn.Parameter(torch.ones(self.num_heads))
             self.D._no_weight_decay = True
         self.use_input_gate = use_input_gate
+
+        if self.qk_norm == 'learned_scalar':
+            init = max(float(learned_norm_init), 1e-6)
+            inv_softplus = math.log(math.expm1(init))
+            self.learned_norm_logit = nn.Parameter(torch.tensor([inv_softplus], dtype=torch.float32))
+            self.learned_norm_logit._no_weight_decay = True
+
+    @staticmethod
+    def _normalize_seq_factor_mode(mode: str) -> str:
+        aliases = {
+            'none': 'none',
+            '1/t': 'inv_t',
+            'inv_t': 'inv_t',
+            '1/sqrt(t)': 'inv_sqrt_t',
+            'inv_sqrt_t': 'inv_sqrt_t',
+            '1/log(t)': 'inv_log_t',
+            '1/log(t+1)': 'inv_log_t',
+            'inv_log_t': 'inv_log_t',
+        }
+        if mode not in aliases:
+            raise ValueError(f"Unsupported seq_factor_mode: {mode}")
+        return aliases[mode]
+
+    def _sequence_factor(self, length: int, device: torch.device, dtype: torch.dtype, mode: Optional[str] = None) -> torch.Tensor:
+        mode = self.seq_factor_mode if mode is None else self._normalize_seq_factor_mode(mode)
+        t = torch.arange(1, length + 1, device=device, dtype=torch.float32)
+        if mode == 'none':
+            factor = torch.ones_like(t)
+        elif mode == 'inv_t':
+            factor = 1.0 / t
+        elif mode == 'inv_sqrt_t':
+            factor = 1.0 / torch.sqrt(t)
+        elif mode == 'inv_log_t':
+            factor = 1.0 / torch.log1p(t)
+        else:
+            raise ValueError(f"Unsupported seq_factor_mode: {mode}")
+        return factor.to(dtype=dtype).view(1, 1, length)
 
 
     def forward(
@@ -213,15 +267,18 @@ class GatedDeltaNet(nn.Module):
         if attention_mask is not None:
             v = v.mul_(attention_mask.unsqueeze(-1))
 
-        gk = self.gk_proj(hidden_states).float()
-        if self.use_mamba_gate:
-            gk = -self.A_log.float().exp() * F.softplus(gk + self.dt_bias)
+        if self.gate_mode == 'dual':
+            gk = self.gk_proj(hidden_states).float()
+            if self.use_mamba_gate:
+                gk = -self.A_log.float().exp() * F.softplus(gk + self.dt_bias)
+            else:
+                gk = F.logsigmoid(gk) / self.gate_logit_normalizer
+            gk = gk.transpose(1, 2)
         else:
-            gk = F.logsigmoid(gk) / self.gate_logit_normalizer
-        gk = gk.transpose(1, 2)
+            gk = None
 
-        beta = self.b_proj(hidden_states).float().sigmoid()
-        beta = beta.transpose(1, 2)
+        raw_beta = self.b_proj(hidden_states).float().sigmoid().transpose(1, 2)
+        beta = raw_beta
         q = rearrange(q, 'b l (h d) -> b h l d', h=self.num_heads)
         if self.num_kv_groups > 1:
             k, v = (repeat(x, 'b l (h d) -> b (h g) l d', h=self.num_kv_heads, g=self.num_kv_groups) for x in (k, v))
@@ -235,7 +292,7 @@ class GatedDeltaNet(nn.Module):
         elif self.qk_norm == 'softmax':
             k = k.softmax(dim=-1).to(v)
             q = q.softmax(dim=-1).to(v)
-        elif self.qk_norm == 'longhorn':            
+        elif self.qk_norm == 'longhorn':
             beta = beta / (1 + beta * (k * k).sum(-1))
         elif self.qk_norm == 'kaczmarz':
             beta = 1 / ((k * k).sum(-1) + 1e-6)
@@ -244,8 +301,25 @@ class GatedDeltaNet(nn.Module):
         elif self.qk_norm == 'relaxed_kaczmarz_q_norm':
             beta = beta / ((k * k).sum(-1) + 1e-6)
             q = l2_norm_fn(q).to(v)
+        elif self.qk_norm == 'no_norm':
+            beta = raw_beta
+        elif self.qk_norm == 'k_norm_only':
+            beta = 1 / ((k * k).sum(-1) + 1e-6)
+        elif self.qk_norm == 'seq_only':
+            beta = self._sequence_factor(k.shape[2], k.device, raw_beta.dtype, mode='inv_t').expand_as(raw_beta)
+        elif self.qk_norm == 'learned_scalar':
+            learned_scalar = F.softplus(self.learned_norm_logit)
+            beta = raw_beta / (learned_scalar * (k * k).sum(-1) + 1e-6)
         else:
             raise KeyError
+
+        if self.qk_norm != 'seq_only' and self.seq_factor_mode != 'none':
+            beta = beta * self._sequence_factor(k.shape[2], k.device, beta.dtype)
+
+        if self.gate_mode == 'single':
+            alpha = (1.0 - raw_beta).clamp(1e-6, 1.0)
+            gk = torch.log(alpha)
+
         if self.use_input_gate:
             original_v_dtype = v.dtype
             v = (v * (1 - gk.float().exp())[..., None]).to(original_v_dtype)

@@ -40,6 +40,15 @@ import pdb
 os.environ["TRITON_CACHE_MANAGER"] = "cache:ParallelFileCacheManager"
 
 
+def str2bool(value: str) -> bool:
+    lowered = value.lower()
+    if lowered in {"1", "true", "yes", "y", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
 def find_resume_checkpoint(out_dir: str) -> str | None:
     """Return a checkpoint path to resume from, preferring latest then final."""
     candidates = [
@@ -109,6 +118,21 @@ def main(args):
             os.makedirs(target_bash_scripts_save_dir)
 
     config = Config.from_name(args.model_name)
+    if args.qk_norm is not None:
+        config.qk_norm = args.qk_norm
+    if args.seq_factor_mode is not None:
+        config.seq_factor_mode = args.seq_factor_mode
+    if args.gate_mode is not None:
+        config.gate_mode = args.gate_mode
+    if args.expand_k is not None:
+        config.expand_k = args.expand_k
+    if args.expand_v is not None:
+        config.expand_v = args.expand_v
+    if args.learned_norm_init is not None:
+        config.learned_norm_init = args.learned_norm_init
+    if args.use_mamba_gate is not None:
+        config.use_mamba_gate = args.use_mamba_gate
+
     train_dataloader, val_dataloader = create_dataloaders(
         batch_size=args.micro_batch_size,
         block_size=config.block_size,
@@ -449,6 +473,13 @@ if __name__ == "__main__":
     group.add_argument('--val_data_dir', default='', type=str, help='validation data directory')
     group.add_argument('--val_data_dir_raw', default='', type=str, help='validation data directory (raw file for stream tok)')
     group.add_argument('--model_name', default='Samba_421M', type=str, help='model name')
+    group.add_argument('--qk_norm', default=None, type=str, help='optional qk_norm override')
+    group.add_argument('--seq_factor_mode', default=None, type=str, help='optional sequence factor mode override')
+    group.add_argument('--gate_mode', default=None, type=str, help='optional gate mode override')
+    group.add_argument('--expand_k', default=None, type=float, help='optional key expansion override')
+    group.add_argument('--expand_v', default=None, type=float, help='optional value expansion override')
+    group.add_argument('--learned_norm_init', default=None, type=float, help='optional learned normalization scalar init')
+    group.add_argument('--use_mamba_gate', default=None, type=str2bool, help='optional mamba gate override')
     group.add_argument('--exp_name', default='', type=str, help='experiment name')
     group.add_argument('--exp_group', default='', type=str, help='experiment group name')
     group.add_argument('--train_config', default='tsz512x4k_20B', type=str, help='training config')
@@ -486,7 +517,7 @@ if __name__ == "__main__":
     nodes = int(_nnodes_env) if _nnodes_env is not None else 1
     args.nodes = nodes
 
-    micro_batch_size = 8
+    recommended_micro_batch_size = 8
 
     if args.max_tokens is not None:
         max_tokens = args.max_tokens
@@ -504,36 +535,39 @@ if __name__ == "__main__":
         raise ValueError("Unknown training token config")
 
     if "512x4k" in name:
-        micro_batch_size = 8
+        recommended_micro_batch_size = 8
         global_batch_size = 512 // nodes
     elif "1024x4k" in name:
-        micro_batch_size = 8
+        recommended_micro_batch_size = 8
         global_batch_size = 1024 // nodes
 
     elif "256x8k" in name:
         global_batch_size = 256 // nodes
-        micro_batch_size = 8
+        recommended_micro_batch_size = 8
 
     elif "128x16k" in name:
         global_batch_size = 128 // nodes
-        micro_batch_size = 4
+        recommended_micro_batch_size = 4
 
     elif "64x32k" in name:
         global_batch_size = 64 // nodes
-        micro_batch_size = 2
+        recommended_micro_batch_size = 2
 
     elif "1024x2k" in name:
         global_batch_size = 1024 // nodes
-        micro_batch_size = 32
+        recommended_micro_batch_size = 32
 
     if "1.3B" in name:
-        micro_batch_size = 4
+        recommended_micro_batch_size = 4
 
-    micro_batch_size = max(1, micro_batch_size)
+    # CLI override takes precedence; use recommended value only when caller passes <= 0.
+    if args.micro_batch_size <= 0:
+        args.micro_batch_size = recommended_micro_batch_size
+    args.micro_batch_size = max(1, int(args.micro_batch_size))
     args.min_lr = args.learning_rate / 10
     args.batch_size = global_batch_size // devices
 
-    gradient_accumulation_steps = args.batch_size // micro_batch_size
+    gradient_accumulation_steps = args.batch_size // args.micro_batch_size
 
     assert gradient_accumulation_steps > 0
     log_iter_interval = args.log_step_interval * gradient_accumulation_steps
@@ -541,8 +575,11 @@ if __name__ == "__main__":
 
     args.warmup_tokens = int(max_tokens * 0.01)
     args.max_tokens = max_tokens
-    if args.micro_batch_size == 0:
-        args.micro_batch_size = micro_batch_size
+    if args.batch_size % args.micro_batch_size != 0:
+        print(
+            "Warning: per-device batch size is not divisible by micro batch size; "
+            "effective global batch may differ slightly from target."
+        )
     args.log_iter_interval= log_iter_interval
     hparams = {k: v for k, v in locals().items() if isinstance(v, (int, float, str)) and not k.startswith("_")}
     args.hparams = hparams

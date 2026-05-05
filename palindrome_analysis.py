@@ -11,6 +11,7 @@ from analysis_plot_style import (
     MODEL_ORDER,
     apply_publication_style,
     format_axis,
+    get_tables_dir,
     get_model_style,
     normalize_model_name,
     save_publication_figure,
@@ -196,6 +197,7 @@ def main():
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
+    tables_dir = get_tables_dir(args.save_dir)
 
     exclude_keywords = _parse_csv_keywords(args.exclude_path_keywords)
     seq_df, step_df, files = load_results(
@@ -211,23 +213,28 @@ def main():
     step_plot_df = aggregate_for_plot(step_df, ["Model", "Step"]) if not step_df.empty else step_df
 
     if not seq_df.empty:
-        seq_df.to_csv(os.path.join(args.save_dir, "seq_len_metrics_raw.csv"), index=False)
-        seq_plot_df.to_csv(os.path.join(args.save_dir, "seq_len_metrics_mean.csv"), index=False)
+        seq_df.to_csv(os.path.join(tables_dir, "seq_len_metrics_raw.csv"), index=False)
+        seq_plot_df.to_csv(os.path.join(tables_dir, "seq_len_metrics_mean.csv"), index=False)
     if not step_df.empty:
-        step_df.to_csv(os.path.join(args.save_dir, "step_metrics_raw.csv"), index=False)
-        step_plot_df.to_csv(os.path.join(args.save_dir, "step_metrics_mean.csv"), index=False)
+        step_df.to_csv(os.path.join(tables_dir, "step_metrics_raw.csv"), index=False)
+        step_plot_df.to_csv(os.path.join(tables_dir, "step_metrics_mean.csv"), index=False)
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7.2, 8.6))
-    plot_seq_len(ax1, seq_df)
-    plot_steps(ax2, step_df)
+    fig_seq, ax_seq = plt.subplots(figsize=(7.2, 4.2))
+    plot_seq_len(ax_seq, seq_df)
+    seq_png_path, seq_pdf_path = save_publication_figure(fig_seq, args.save_dir, "palindrome_seq_len_metrics")
+    plt.close(fig_seq)
 
-    png_path, pdf_path = save_publication_figure(fig, args.save_dir, "palindrome_metrics")
-    plt.close(fig)
+    fig_step, ax_step = plt.subplots(figsize=(7.2, 4.2))
+    plot_steps(ax_step, step_df)
+    step_png_path, step_pdf_path = save_publication_figure(fig_step, args.save_dir, "palindrome_step_metrics")
+    plt.close(fig_step)
 
     print(f"Loaded {len(files)} result files")
     print(f"Saved plots and tables to {args.save_dir}")
-    print(f"Figure: {png_path}")
-    print(f"Figure: {pdf_path}")
+    print(f"Figure: {seq_png_path}")
+    print(f"Figure: {seq_pdf_path}")
+    print(f"Figure: {step_png_path}")
+    print(f"Figure: {step_pdf_path}")
 
 
 if __name__ == "__main__":

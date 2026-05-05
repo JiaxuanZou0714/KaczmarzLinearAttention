@@ -7,7 +7,7 @@ import re
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from analysis_plot_style import apply_publication_style, save_publication_figure
+from analysis_plot_style import apply_publication_style, get_tables_dir, save_publication_figure
 
 
 MODEL_DIR_MAP = {
@@ -203,7 +203,7 @@ def plot_curve(curve_df: pd.DataFrame, save_dir: str, stem: str, max_plot_points
 
     handles, labels = ax.get_legend_handles_labels()
     if handles:
-        ax.legend(loc="upper right", frameon=False, handlelength=2.8)
+        ax.legend(loc="lower right", frameon=False, handlelength=2.8)
 
     return save_publication_figure(fig, save_dir, stem)
 
@@ -229,6 +229,7 @@ def main():
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
+    tables_dir = get_tables_dir(args.save_dir)
 
     curve_df, final_df, missing_models, no_curve_models = collect_model_metrics(args.wandb_root)
     suffix = _suffix_from_min_tokens(args.min_tokens)
@@ -237,7 +238,7 @@ def main():
         print("No 1B model val_ppl@1x metrics found.")
         return
 
-    final_df.to_csv(os.path.join(args.save_dir, "pretrain_val_ppl_1x_final_1B.csv"), index=False)
+    final_df.to_csv(os.path.join(tables_dir, "pretrain_val_ppl_1x_final_1B.csv"), index=False)
 
     if not curve_df.empty and args.min_tokens > 0:
         curve_df = curve_df[curve_df["Tokens"] >= int(args.min_tokens)].copy()
@@ -247,7 +248,7 @@ def main():
         if args.min_tokens > 0:
             print(f"No curve points satisfy tokens >= {args.min_tokens}.")
     else:
-        curve_csv = os.path.join(args.save_dir, f"pretrain_val_ppl_1x_curve_1B{suffix}.csv")
+        curve_csv = os.path.join(tables_dir, f"pretrain_val_ppl_1x_curve_1B{suffix}.csv")
         curve_df.to_csv(curve_csv, index=False)
         stem = f"pretrain_val_ppl_1x_curve_1B{suffix}"
         png_path, pdf_path = plot_curve(curve_df, args.save_dir, stem, max_plot_points=args.max_plot_points)

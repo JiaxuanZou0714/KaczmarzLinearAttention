@@ -11,6 +11,7 @@ import pandas as pd
 from analysis_plot_style import (
     MODEL_ORDER,
     apply_publication_style,
+    get_tables_dir,
     get_model_style,
     normalize_model_name,
     save_publication_figure,
@@ -195,7 +196,7 @@ def _plot_prefill_latency(ax, prefill_df: pd.DataFrame, plot_order):
     ax.grid(True, which="minor", linewidth=0.4, alpha=0.2, linestyle=":")
     handles, labels = ax.get_legend_handles_labels()
     if handles:
-        ax.legend(loc="best", frameon=False, handlelength=2.8)
+        ax.legend(loc="lower right", frameon=False, handlelength=2.8)
 
 
 def _plot_decode_throughput(ax, decode_df: pd.DataFrame, plot_order):
@@ -227,7 +228,7 @@ def _plot_decode_throughput(ax, decode_df: pd.DataFrame, plot_order):
     ax.grid(True, which="minor", linewidth=0.4, alpha=0.2, linestyle=":")
     handles, labels = ax.get_legend_handles_labels()
     if handles:
-        ax.legend(loc="best", frameon=False, handlelength=2.8)
+        ax.legend(loc="lower right", frameon=False, handlelength=2.8)
 
 
 def _plot_decode_tpot(ax, decode_df: pd.DataFrame, plot_order):
@@ -259,7 +260,7 @@ def _plot_decode_tpot(ax, decode_df: pd.DataFrame, plot_order):
     ax.grid(True, which="minor", linewidth=0.4, alpha=0.2, linestyle=":")
     handles, labels = ax.get_legend_handles_labels()
     if handles:
-        ax.legend(loc="best", frameon=False, handlelength=2.8)
+        ax.legend(loc="lower right", frameon=False, handlelength=2.8)
 
 
 def _pick_batch(df: pd.DataFrame, requested: int) -> int:
@@ -299,6 +300,7 @@ def main():
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
+    tables_dir = get_tables_dir(args.save_dir)
 
     raw_df, files = load_results(args.out_root)
     if not files:
@@ -328,10 +330,10 @@ def main():
         & (decode_mean["New Tokens"] == selected_new_tokens)
     ].copy()
 
-    raw_csv = os.path.join(args.save_dir, "efficiency_raw.csv")
-    mean_csv = os.path.join(args.save_dir, "efficiency_mean.csv")
-    prefill_csv = os.path.join(args.save_dir, "efficiency_prefill_summary.csv")
-    decode_csv = os.path.join(args.save_dir, "efficiency_decode_summary.csv")
+    raw_csv = os.path.join(tables_dir, "efficiency_raw.csv")
+    mean_csv = os.path.join(tables_dir, "efficiency_mean.csv")
+    prefill_csv = os.path.join(tables_dir, "efficiency_prefill_summary.csv")
+    decode_csv = os.path.join(tables_dir, "efficiency_decode_summary.csv")
 
     raw_df.to_csv(raw_csv, index=False)
     mean_df.to_csv(mean_csv, index=False)
@@ -339,6 +341,9 @@ def main():
     decode_mean.to_csv(decode_csv, index=False)
 
     stale_kv_artifacts = [
+        os.path.join(tables_dir, "efficiency_kv_cache_summary.csv"),
+        os.path.join(args.save_dir, "figures", f"{args.figure_stem}_kv_cache.png"),
+        os.path.join(args.save_dir, "figures", f"{args.figure_stem}_kv_cache.pdf"),
         os.path.join(args.save_dir, "efficiency_kv_cache_summary.csv"),
         os.path.join(args.save_dir, f"{args.figure_stem}_kv_cache.png"),
         os.path.join(args.save_dir, f"{args.figure_stem}_kv_cache.pdf"),

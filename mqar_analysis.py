@@ -12,6 +12,7 @@ from analysis_plot_style import (
     MODEL_ORDER,
     apply_publication_style,
     format_axis,
+    get_tables_dir,
     get_model_style,
     normalize_model_name,
     save_publication_figure,
@@ -383,6 +384,7 @@ def main():
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
+    tables_dir = get_tables_dir(args.save_dir)
 
     test_df, val_df, files = load_results(args.out_root)
     if not files:
@@ -405,22 +407,21 @@ def main():
         print(curve_df.groupby(["Model", "Step"])["Val Acc"].mean().head(20))
 
     if not test_df.empty:
-        test_df.to_csv(os.path.join(args.save_dir, "summary_raw.csv"), index=False)
+        test_df.to_csv(os.path.join(tables_dir, "summary_raw.csv"), index=False)
         test_df_mean = aggregate_for_plot(test_df, ["Model", "Seq Len", "Key Len"], "Test Acc")
-        test_df_mean.to_csv(os.path.join(args.save_dir, "summary_mean.csv"), index=False)
+        test_df_mean.to_csv(os.path.join(tables_dir, "summary_mean.csv"), index=False)
 
     if not val_df.empty:
-        val_df.to_csv(os.path.join(args.save_dir, "final_val_extrapolation_raw.csv"), index=False)
+        val_df.to_csv(os.path.join(tables_dir, "final_val_extrapolation_raw.csv"), index=False)
         val_df_mean = aggregate_for_plot(val_df, ["Model", "Train Seq Len", "Eval Seq Len"], "Val Acc")
-        val_df_mean.to_csv(os.path.join(args.save_dir, "final_val_extrapolation_mean.csv"), index=False)
+        val_df_mean.to_csv(os.path.join(tables_dir, "final_val_extrapolation_mean.csv"), index=False)
 
     if not curve_df.empty:
-        curve_df.to_csv(os.path.join(args.save_dir, "val_curve_raw.csv"), index=False)
+        curve_df.to_csv(os.path.join(tables_dir, "val_curve_raw.csv"), index=False)
         curve_df_mean = aggregate_for_plot(curve_df, ["Model", "Step"], "Val Acc")
-        curve_df_mean.to_csv(os.path.join(args.save_dir, "val_curve_mean.csv"), index=False)
+        curve_df_mean.to_csv(os.path.join(tables_dir, "val_curve_mean.csv"), index=False)
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7.2, 8.6))
-
+    fig_top, ax1 = plt.subplots(figsize=(7.2, 4.2))
     if not val_df.empty:
         plot_final_val_extrapolation(ax1, val_df)
         ax1.set_ylim(50, 102)
@@ -431,7 +432,10 @@ def main():
     else:
         ax1.text(0.5, 0.5, "No plot data available", ha="center", va="center")
         ax1.set_axis_off()
+    top_png_path, top_pdf_path = save_publication_figure(fig_top, args.save_dir, "mqar_metrics_panel1")
+    plt.close(fig_top)
 
+    fig_bottom, ax2 = plt.subplots(figsize=(7.2, 4.2))
     if not curve_df.empty:
         plot_training_val_curve(ax2, curve_df)
     elif not test_df.empty:
@@ -440,14 +444,15 @@ def main():
     else:
         ax2.text(0.5, 0.5, "No step curve metrics found", ha="center", va="center")
         ax2.set_axis_off()
-
-    png_path, pdf_path = save_publication_figure(fig, args.save_dir, "mqar_metrics")
-    plt.close(fig)
+    bottom_png_path, bottom_pdf_path = save_publication_figure(fig_bottom, args.save_dir, "mqar_metrics_panel2")
+    plt.close(fig_bottom)
 
     print(f"Loaded {len(files)} result files")
     print(f"Saved plots and tables to {args.save_dir}")
-    print(f"Figure: {png_path}")
-    print(f"Figure: {pdf_path}")
+    print(f"Figure: {top_png_path}")
+    print(f"Figure: {top_pdf_path}")
+    print(f"Figure: {bottom_png_path}")
+    print(f"Figure: {bottom_pdf_path}")
 
 
 if __name__ == "__main__":

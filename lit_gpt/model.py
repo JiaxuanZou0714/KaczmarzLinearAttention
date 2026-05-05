@@ -365,6 +365,11 @@ class Block(nn.Module):
                 qk_norm=config.qk_norm,
                 num_heads=config.n_head,
                 use_mamba_gate=config.use_mamba_gate,
+                seq_factor_mode=config.seq_factor_mode,
+                gate_mode=config.gate_mode,
+                expand_k=config.expand_k,
+                expand_v=config.expand_v,
+                learned_norm_init=config.learned_norm_init,
             )
         elif self.use_gla:
             self.attn = SimpleGLA(config, n_embd=config.n_embd)

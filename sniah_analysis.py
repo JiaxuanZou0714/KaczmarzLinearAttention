@@ -11,6 +11,7 @@ from matplotlib.ticker import FuncFormatter
 from analysis_plot_style import (
     apply_publication_style,
     format_axis,
+    get_tables_dir,
     get_model_style,
     normalize_model_name,
     save_publication_figure,
@@ -119,23 +120,23 @@ def _parse_val_curve_from_output_log(path: str):
 
 
 def _variant_model_name(model_name: str, args: dict, out_root: str) -> str:
+    return model_name
+
+
+def _is_preferred_mamba_run(args: dict, out_root: str) -> bool:
     early_stop_patience = args.get("early_stop_patience")
     out_dir = str(args.get("out_dir", ""))
     out_root_str = str(out_root)
 
-    looks_like_no_early_stop = (
+    return (
         (isinstance(early_stop_patience, (int, float)) and early_stop_patience >= 100000)
         or ("no_early_stop" in out_dir.lower())
         or ("no_early_stop" in out_root_str.lower())
     )
 
-    if model_name == "Mamba2" and looks_like_no_early_stop:
-        return "Mamba2 (No-ES)"
-    return model_name
-
 
 def _ordered_models(df: pd.DataFrame):
-    preferred = ["KLA", "GDN", "Mamba2", "Mamba2 (No-ES)"]
+    preferred = ["KLA", "GDN", "Mamba2"]
     present = set(df["Model"].tolist())
     ordered = [model for model in preferred if model in present]
     extras = sorted(present.difference(set(ordered)))
@@ -143,16 +144,33 @@ def _ordered_models(df: pd.DataFrame):
 
 
 def _get_plot_style(model_name: str):
-    if model_name == "Mamba2 (No-ES)":
-        return {"color": "#E15759", "linestyle": ":", "marker": "D"}
     return get_model_style(model_name)
 
 
 def _filter_only_no_es(df: pd.DataFrame):
-    if df.empty or "Model" not in df.columns:
+    if df.empty or "Model" not in df.columns or "Run Tag" not in df.columns:
         return df
-    # Keep KLA/GDN unchanged, and keep only the No-ES variant for Mamba2.
-    return df[df["Model"] != "Mamba2"].copy()
+    mamba_mask = df["Model"] == "Mamba2"
+    if not mamba_mask.any():
+        return df
+    preferred_mask = mamba_mask & (df["Run Tag"] == "Preferred")
+    if preferred_mask.any():
+        return df[(~mamba_mask) | preferred_mask].copy()
+    return df
+
+
+def _filter_single_mamba(df: pd.DataFrame):
+    if df.empty or "Model" not in df.columns or "Run Tag" not in df.columns:
+        return df
+    # Prefer the designated Mamba2 run when both preferred/regular Mamba2 runs exist.
+    mamba_df = df[df["Model"] == "Mamba2"]
+    if mamba_df.empty:
+        return df
+    has_preferred = (mamba_df["Run Tag"] == "Preferred").any()
+    has_regular = (mamba_df["Run Tag"] == "Regular").any()
+    if has_preferred and has_regular:
+        return df[(df["Model"] != "Mamba2") | (df["Run Tag"] == "Preferred")].copy()
+    return df
 
 
 def aggregate_for_plot(df: pd.DataFrame, group_cols, metric_col: str):
@@ -185,6 +203,10 @@ def load_results(out_roots, min_max_steps: int):
             model_raw = data.get("model_name", "Unknown")
             model_base = normalize_model_name(model_raw)
             model = _variant_model_name(model_base, args, out_root)
+            is_preferred_mamba = model == "Mamba2" and _is_preferred_mamba_run(args, out_root)
+            run_tag = "Main"
+            if model == "Mamba2":
+                run_tag = "Preferred" if is_preferred_mamba else "Regular"
 
             data_dir = args.get("data_dir", "")
             exp_name = args.get("exp_name", "")
@@ -208,7 +230,7 @@ def load_results(out_roots, min_max_steps: int):
                         {
                             "Model": model,
                             "Model Raw": model_raw,
-                            "Run Tag": "No-ES" if model == "Mamba2 (No-ES)" else "Default",
+                            "Run Tag": run_tag,
                             "Val Acc": float(acc) * 100.0,
                             "Factor": int(factor),
                             "Train Seq Len": int(seq_len),
@@ -228,7 +250,7 @@ def load_results(out_roots, min_max_steps: int):
                 {
                     "Model": model,
                     "Model Raw": model_raw,
-                    "Run Tag": "No-ES" if model == "Mamba2 (No-ES)" else "Default",
+                    "Run Tag": run_tag,
                     "Test Acc": float(test_acc) * 100.0,
                     "Best Val Acc": float(best_val_acc) * 100.0 if best_val_acc is not None else None,
                     "Seed": args.get("seed"),
@@ -366,12 +388,17 @@ def main():
     parser.add_argument(
         "--only_no_es",
         action="store_true",
-        help="Keep only Mamba2 No-ES run for Mamba curves; keep other models unchanged.",
+        help="Keep only the preferred Mamba2 run when multiple Mamba2 runs are available.",
+    )
+    parser.add_argument(
+        "--keep_both_mamba",
+        action="store_true",
+        help="Keep both preferred and regular Mamba2 runs when both are available.",
     )
     parser.add_argument(
         "--max_curve_step",
         type=int,
-        default=None,
+        default=6000,
         help="Maximum step shown in the training-val curve panel.",
     )
     parser.add_argument(
@@ -384,6 +411,7 @@ def main():
 
     out_roots = [item.strip() for item in args.out_roots.split(",") if item.strip()]
     os.makedirs(args.save_dir, exist_ok=True)
+    tables_dir = get_tables_dir(args.save_dir)
 
     test_df, val_df, files = load_results(out_roots, min_max_steps=args.min_max_steps)
     if not files:
@@ -393,30 +421,44 @@ def main():
     if args.only_no_es:
         test_df = _filter_only_no_es(test_df)
         val_df = _filter_only_no_es(val_df)
+    elif not args.keep_both_mamba:
+        test_df = _filter_single_mamba(test_df)
+        val_df = _filter_single_mamba(val_df)
 
     curve_df = load_training_val_curves(test_df)
     if args.max_curve_step is not None and not curve_df.empty:
         curve_df = curve_df[curve_df["Step"] <= int(args.max_curve_step)].copy()
 
-    test_df.to_csv(os.path.join(args.save_dir, "summary_raw.csv"), index=False)
+    test_df.to_csv(os.path.join(tables_dir, "summary_raw.csv"), index=False)
     test_mean = aggregate_for_plot(test_df, ["Model"], "Test Acc")
-    test_mean.to_csv(os.path.join(args.save_dir, "summary_mean.csv"), index=False)
+    test_mean.to_csv(os.path.join(tables_dir, "summary_mean.csv"), index=False)
 
-    val_df.to_csv(os.path.join(args.save_dir, "final_val_extrapolation_raw.csv"), index=False)
+    val_df.to_csv(os.path.join(tables_dir, "final_val_extrapolation_raw.csv"), index=False)
     val_mean = aggregate_for_plot(val_df, ["Model", "Eval Seq Len"], "Val Acc")
-    val_mean.to_csv(os.path.join(args.save_dir, "final_val_extrapolation_mean.csv"), index=False)
+    val_mean.to_csv(os.path.join(tables_dir, "final_val_extrapolation_mean.csv"), index=False)
 
     if not curve_df.empty:
-        curve_df.to_csv(os.path.join(args.save_dir, "val_curve_raw.csv"), index=False)
+        curve_df.to_csv(os.path.join(tables_dir, "val_curve_raw.csv"), index=False)
         curve_mean = aggregate_for_plot(curve_df, ["Model", "Step"], "Val Acc")
-        curve_mean.to_csv(os.path.join(args.save_dir, "val_curve_mean.csv"), index=False)
+        curve_mean.to_csv(os.path.join(tables_dir, "val_curve_mean.csv"), index=False)
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7.2, 8.6))
-    plot_final_val_extrapolation(ax1, val_df)
-    plot_training_val_curve(ax2, curve_df, max_curve_step=args.max_curve_step)
+    fig_extrap, ax_extrap = plt.subplots(figsize=(7.2, 4.2))
+    plot_final_val_extrapolation(ax_extrap, val_df)
+    extrap_png_path, extrap_pdf_path = save_publication_figure(
+        fig_extrap,
+        args.save_dir,
+        f"{args.figure_stem}_final_val_extrapolation",
+    )
+    plt.close(fig_extrap)
 
-    png_path, pdf_path = save_publication_figure(fig, args.save_dir, args.figure_stem)
-    plt.close(fig)
+    fig_curve, ax_curve = plt.subplots(figsize=(7.2, 4.2))
+    plot_training_val_curve(ax_curve, curve_df, max_curve_step=args.max_curve_step)
+    curve_png_path, curve_pdf_path = save_publication_figure(
+        fig_curve,
+        args.save_dir,
+        f"{args.figure_stem}_training_val_curve",
+    )
+    plt.close(fig_curve)
 
     print("Loaded SNIAH test results (mean acc %):")
     print(test_mean.sort_values("Test Acc", ascending=False))
@@ -424,8 +466,10 @@ def main():
     print(val_mean.sort_values(["Eval Seq Len", "Val Acc"], ascending=[True, False]))
     print(f"Loaded {len(files)} result files")
     print(f"Saved plots and tables to {args.save_dir}")
-    print(f"Figure: {png_path}")
-    print(f"Figure: {pdf_path}")
+    print(f"Figure: {extrap_png_path}")
+    print(f"Figure: {extrap_pdf_path}")
+    print(f"Figure: {curve_png_path}")
+    print(f"Figure: {curve_pdf_path}")
 
 
 if __name__ == "__main__":

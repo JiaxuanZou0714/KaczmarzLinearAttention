@@ -10,6 +10,7 @@ import pandas as pd
 from analysis_plot_style import (
     MODEL_ORDER,
     apply_publication_style,
+    get_tables_dir,
     get_model_style,
     normalize_model_name,
     save_publication_figure,
@@ -249,7 +250,7 @@ def plot_ppl_curve(ax, mean_df: pd.DataFrame, plot_order):
     ax.grid(True, which="minor", linewidth=0.4, alpha=0.2, linestyle=":")
     handles, labels = ax.get_legend_handles_labels()
     if handles:
-        ax.legend(loc="best", frameon=False, handlelength=2.8)
+        ax.legend(loc="lower right", frameon=False, handlelength=2.8)
 
 
 def plot_relative_curve(ax, relative_df: pd.DataFrame, plot_order):
@@ -299,6 +300,7 @@ def main():
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
+    tables_dir = get_tables_dir(args.save_dir)
 
     raw_df, files = load_results(args.out_root)
     if not files:
@@ -316,10 +318,10 @@ def main():
     mean_df = aggregate_mean(raw_df)
     relative_df, slope_df = build_relative_and_slope(mean_df, baseline_length=args.baseline_length)
 
-    raw_csv = os.path.join(args.save_dir, "long_context_ppl_raw.csv")
-    mean_csv = os.path.join(args.save_dir, "long_context_ppl_mean.csv")
-    rel_csv = os.path.join(args.save_dir, "long_context_relative_to_baseline.csv")
-    slope_csv = os.path.join(args.save_dir, "long_context_slope_summary.csv")
+    raw_csv = os.path.join(tables_dir, "long_context_ppl_raw.csv")
+    mean_csv = os.path.join(tables_dir, "long_context_ppl_mean.csv")
+    rel_csv = os.path.join(tables_dir, "long_context_relative_to_baseline.csv")
+    slope_csv = os.path.join(tables_dir, "long_context_slope_summary.csv")
 
     raw_df.to_csv(raw_csv, index=False)
     mean_df.to_csv(mean_csv, index=False)

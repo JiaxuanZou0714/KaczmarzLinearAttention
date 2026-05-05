@@ -18,6 +18,7 @@ MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-4}"
 LR="${LR:-1e-4}"
 MAX_TOKENS="${MAX_TOKENS:-$FULL_TRAIN_TOKENS}"
 EVAL_STEP_INTERVAL="${EVAL_STEP_INTERVAL:-0}"
+EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 # Directories
 LOGS_DIR="${SAVE_DIR}/logs/${NAME}/"
@@ -67,6 +68,7 @@ echo "Max Tokens: ${MAX_TOKENS}"
 echo "Total Evals: ${TOTAL_EVALS}"
 echo "W&B Mode: ${WANDB_MODE}"
 echo "W&B Dir: ${WANDB_DIR}"
+echo "Extra Args: ${EXTRA_ARGS}"
 
 ${PYTHON_BIN} -u ${OUTPUT_ROOT}/pretrain.py \
     --train_data_dir ${TRAIN_DATA} \
@@ -81,4 +83,5 @@ ${PYTHON_BIN} -u ${OUTPUT_ROOT}/pretrain.py \
     --learning_rate ${LR} \
     --micro_batch_size ${MICRO_BATCH_SIZE} \
     --max_tokens ${MAX_TOKENS} \
-    --seed ${SEED}
+    --seed ${SEED} \
+    ${EXTRA_ARGS}

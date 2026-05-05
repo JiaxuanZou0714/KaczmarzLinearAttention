@@ -73,13 +73,25 @@ def format_axis(ax, xlabel: str, ylabel: str, ylim=(0, 102)) -> None:
 
     handles, labels = ax.get_legend_handles_labels()
     if handles:
-        ax.legend(loc="best", frameon=False, handlelength=2.8)
+        ax.legend(loc="lower right", frameon=False, handlelength=2.8)
+
+
+def get_figures_dir(save_dir: str) -> str:
+    figures_dir = os.path.join(save_dir, "figures")
+    os.makedirs(figures_dir, exist_ok=True)
+    return figures_dir
+
+
+def get_tables_dir(save_dir: str) -> str:
+    tables_dir = os.path.join(save_dir, "tables")
+    os.makedirs(tables_dir, exist_ok=True)
+    return tables_dir
 
 
 def save_publication_figure(fig, save_dir: str, stem: str):
-    os.makedirs(save_dir, exist_ok=True)
-    png_path = os.path.join(save_dir, f"{stem}.png")
-    pdf_path = os.path.join(save_dir, f"{stem}.pdf")
+    figures_dir = get_figures_dir(save_dir)
+    png_path = os.path.join(figures_dir, f"{stem}.png")
+    pdf_path = os.path.join(figures_dir, f"{stem}.pdf")
     fig.savefig(png_path)
     fig.savefig(pdf_path)
     return png_path, pdf_path
